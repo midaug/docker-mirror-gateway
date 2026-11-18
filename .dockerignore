@@ -1,0 +1,10 @@
+.git
+.gitignore
+.workbuddy
+bin
+data
+*.log
+.DS_Store
+README.md
+docker-compose.yml
+docs

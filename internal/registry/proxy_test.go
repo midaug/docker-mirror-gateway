@@ -1,0 +1,449 @@
+package registry
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/midaug/docker-mirror-gateway/internal/activity"
+	"github.com/midaug/docker-mirror-gateway/internal/cache"
+	"github.com/midaug/docker-mirror-gateway/internal/config"
+	"github.com/midaug/docker-mirror-gateway/internal/metrics"
+)
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+type fakeManifest struct {
+	body      []byte
+	mediaType string
+	digest    string
+}
+
+// fakeRegistry 模拟一个带 token 认证的 Docker Registry。
+type fakeRegistry struct {
+	*httptest.Server
+	t            *testing.T
+	token        string
+	manifests    map[string]fakeManifest
+	blobs        map[string][]byte
+	fail         bool
+	manifestReqs atomic.Int64
+	blobReqs     atomic.Int64
+	tagsReqs     atomic.Int64
+	seen         atomic.Value
+}
+
+func newFakeRegistry(t *testing.T) *fakeRegistry {
+	t.Helper()
+	f := &fakeRegistry{
+		t:         t,
+		token:     "test-token",
+		manifests: map[string]fakeManifest{},
+		blobs:     map[string][]byte{},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"token":"test-token","expires_in":300}`)
+	})
+	mux.HandleFunc("/v2/", f.handle)
+	f.Server = httptest.NewServer(mux)
+	t.Cleanup(f.Server.Close)
+	return f
+}
+
+func (f *fakeRegistry) addManifest(name, ref string, mediaType string, body []byte) string {
+	sum := sha256.Sum256(body)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	f.manifests[name+"@"+ref] = fakeManifest{body: body, mediaType: mediaType, digest: digest}
+	return digest
+}
+
+func (f *fakeRegistry) handle(w http.ResponseWriter, r *http.Request) {
+	if f.token != "" && r.Header.Get("Authorization") != "Bearer "+f.token {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token",service="fake-registry"`, f.Server.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if f.fail {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	f.seen.Store(r.URL.Path)
+
+	kind, name, ref := ParseV2Path(strings.TrimPrefix(r.URL.Path, "/v2/"))
+	switch kind {
+	case PathManifest:
+		f.manifestReqs.Add(1)
+		m, ok := f.manifests[name+"@"+ref]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", m.mediaType)
+		w.Header().Set("Docker-Content-Digest", m.digest)
+		w.Header().Set("Content-Length", strconv.Itoa(len(m.body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(m.body)
+	case PathTags:
+		f.tagsReqs.Add(1)
+		prefix := name + "@"
+		tags := make([]string, 0, 2)
+		for k := range f.manifests {
+			if strings.HasPrefix(k, prefix) {
+				if ref := strings.TrimPrefix(k, prefix); !IsDigest(ref) {
+					tags = append(tags, ref)
+				}
+			}
+		}
+		if len(tags) == 0 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := json.Marshal(map[string]any{"name": name, "tags": tags})
+		_, _ = w.Write(body)
+	case PathBlob:
+		f.blobReqs.Add(1)
+		data, ok := f.blobs[ref]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:1])
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Docker-Content-Digest", ref)
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func newTestProxy(t *testing.T, upstreams []config.UpstreamConfig, c *cache.Cache) *Proxy {
+	t.Helper()
+	p, _ := newTestProxyWithRouter(t, upstreams, c)
+	return p
+}
+
+func newTestProxyWithRouter(t *testing.T, upstreams []config.UpstreamConfig, c *cache.Cache) (*Proxy, *Router) {
+	t.Helper()
+	log := testLogger()
+	m := metrics.New()
+	cfg := config.Default()
+	cfg.Groups = []config.GroupConfig{{
+		Name:             "test",
+		Priority:         10,
+		Aliases:          []string{"test", "docker.io"},
+		Default:          true,
+		LibraryNamespace: "library",
+		Upstreams:        upstreams,
+	}}
+	cfg.Routing.AutoDetect = false
+	cfg.Routing.DefaultGroup = "test"
+	cfg.Health.Timeout = config.Duration(2 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	router, err := NewRouter(cfg, log, m)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	return NewProxy(router, c, Options{MaxManifestBytes: 1 << 20}, log, m), router
+}
+
+func newTestCache(t *testing.T) *cache.Cache {
+	t.Helper()
+	c, err := cache.New(cache.Config{Dir: t.TempDir(), MaxBytes: 64 << 20, TagTTL: time.Minute})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	return c
+}
+
+func TestProxyManifestAndBlob(t *testing.T) {
+	f := newFakeRegistry(t)
+	manifestBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}`)
+	digest := f.addManifest("library/alpine", "latest", MediaTypeDockerManifestList, manifestBody)
+
+	blob := []byte("hello-blob-content")
+	blobSum := sha256.Sum256(blob)
+	blobDigest := "sha256:" + hex.EncodeToString(blobSum[:])
+	f.blobs[blobDigest] = blob
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}}, c)
+
+	accept := MediaTypeDockerManifestList + ", " + MediaTypeDockerManifest
+
+	// 1. 首次拉取 manifest（未命中缓存）
+	req := httptest.NewRequest(http.MethodGet, "/v2/library/alpine/manifests/latest", nil)
+	req.Header.Set("Accept", accept)
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, req, "alpine", "latest")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manifest 状态码 = %d, 期望 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Docker-Content-Digest"); got != digest {
+		t.Errorf("Docker-Content-Digest = %q, 期望 %q", got, digest)
+	}
+	if got := rec.Header().Get("Content-Type"); got != MediaTypeDockerManifestList {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if got := rec.Header().Get("X-Mirror-Gateway-Upstream"); got != "fake" {
+		t.Errorf("X-Mirror-Gateway-Upstream = %q", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), manifestBody) {
+		t.Errorf("manifest body 不一致")
+	}
+	if path, _ := f.seen.Load().(string); path != "/v2/library/alpine/manifests/latest" {
+		t.Errorf("上游收到的路径 = %q，说明名称归一化失败", path)
+	}
+
+	// 2. 再次拉取应命中缓存
+	rec = httptest.NewRecorder()
+	p.ServeManifest(rec, req.Clone(req.Context()), "alpine", "latest")
+	if got := rec.Header().Get("X-Mirror-Gateway-Cache"); got != "hit" {
+		t.Errorf("第二次请求缓存状态 = %q, 期望 hit", got)
+	}
+	if n := f.manifestReqs.Load(); n != 1 {
+		t.Errorf("上游 manifest 请求次数 = %d, 期望 1", n)
+	}
+
+	// 3. 按 digest 拉取也应命中（写入缓存时同时存了 digest key）
+	rec = httptest.NewRecorder()
+	digestReq := httptest.NewRequest(http.MethodGet, "/v2/library/alpine/manifests/"+digest, nil)
+	digestReq.Header.Set("Accept", accept)
+	p.ServeManifest(rec, digestReq, "library/alpine", digest)
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Mirror-Gateway-Cache") != "hit" {
+		t.Errorf("按 digest 拉取未命中缓存: code=%d cache=%q", rec.Code, rec.Header().Get("X-Mirror-Gateway-Cache"))
+	}
+	if n := f.manifestReqs.Load(); n != 1 {
+		t.Errorf("按 digest 拉取后上游请求次数 = %d, 期望仍为 1", n)
+	}
+
+	// 4. HEAD blob（未缓存）
+	rec = httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodHead, "/v2/library/alpine/blobs/"+blobDigest, nil), "library/alpine", blobDigest)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD blob 状态码 = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(blob)) {
+		t.Errorf("HEAD blob Content-Length = %q, 期望 %d", got, len(blob))
+	}
+
+	// 5. GET blob，应边下发边缓存
+	rec = httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/alpine/blobs/"+blobDigest, nil), "library/alpine", blobDigest)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET blob 状态码 = %d", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), blob) {
+		t.Errorf("blob 内容不一致")
+	}
+	if size, ok := c.HasBlob(blobDigest); !ok || size != int64(len(blob)) {
+		t.Errorf("blob 未落盘, ok=%v size=%d", ok, size)
+	}
+
+	// 6. 再次 GET 应命中缓存
+	before := f.blobReqs.Load()
+	rec = httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/alpine/blobs/"+blobDigest, nil), "library/alpine", blobDigest)
+	if got := rec.Header().Get("X-Mirror-Gateway-Cache"); got != "hit" {
+		t.Errorf("第二次 blob 缓存状态 = %q", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), blob) {
+		t.Errorf("缓存 blob 内容不一致")
+	}
+	if after := f.blobReqs.Load(); after != before {
+		t.Errorf("缓存命中后仍回源: %d -> %d", before, after)
+	}
+
+	stats := p.Stats()
+	if stats.CacheHits == 0 || stats.CacheMisses == 0 {
+		t.Errorf("缓存统计异常: %+v", stats)
+	}
+}
+
+func TestProxyFailover(t *testing.T) {
+	bad := newFakeRegistry(t)
+	bad.fail = true
+	good := newFakeRegistry(t)
+
+	body := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{}}`)
+	digest := good.addManifest("library/nginx", "latest", MediaTypeDockerManifest, body)
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "bad", URL: bad.URL, Priority: 10},
+		{Name: "good", URL: good.URL, Priority: 20},
+	}, c)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil)
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, req, "library/nginx", "latest")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("故障转移后状态码 = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Mirror-Gateway-Upstream"); got != "good" {
+		t.Errorf("实际服务上游 = %q, 期望 good", got)
+	}
+	if got := rec.Header().Get("Docker-Content-Digest"); got != digest {
+		t.Errorf("digest = %q", got)
+	}
+}
+
+func TestProxyManifestNotFound(t *testing.T) {
+	f := newFakeRegistry(t)
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}}, c)
+
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, httptest.NewRequest(http.MethodGet, "/v2/library/missing/manifests/latest", nil), "library/missing", "latest")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d, 期望 404, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "MANIFEST_UNKNOWN") {
+		t.Errorf("错误码不符合 Registry 规范: %s", rec.Body.String())
+	}
+}
+
+func TestProxyRejectsInvalidInput(t *testing.T) {
+	f := newFakeRegistry(t)
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}}, c)
+
+	rec := httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/alpine/blobs/not-a-digest", nil), "library/alpine", "not-a-digest")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("非法 digest 状态码 = %d, 期望 400", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	p.ServeManifest(rec, httptest.NewRequest(http.MethodPut, "/v2/library/alpine/manifests/latest", nil), "library/alpine", "latest")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("PUT 状态码 = %d, 期望 405", rec.Code)
+	}
+}
+
+func TestProxyBlobDigestMismatchNotCached(t *testing.T) {
+	f := newFakeRegistry(t)
+	// 上游返回的内容与请求的 digest 不一致
+	wrong := []byte("actual-content")
+	sum := sha256.Sum256(wrong)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	f.blobs[digest] = []byte("tampered-content")
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}}, c)
+
+	rec := httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/alpine/blobs/"+digest, nil), "library/alpine", digest)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d", rec.Code)
+	}
+	if _, ok := c.HasBlob(digest); ok {
+		t.Error("digest 校验失败的内容不应写入缓存")
+	}
+}
+
+// 拉取活动应被完整记录：manifest 一条、blob 一条，按时间倒序输出。
+func TestProxyRecordsActivity(t *testing.T) {
+	f := newFakeRegistry(t)
+	manifestBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`)
+	f.addManifest("library/alpine", "1.0", MediaTypeDockerManifest, manifestBody)
+
+	blob := bytes.Repeat([]byte("a"), 8192)
+	sum := sha256.Sum256(blob)
+	blobDigest := "sha256:" + hex.EncodeToString(sum[:])
+	f.blobs[blobDigest] = blob
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}}, c)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v2/library/alpine/manifests/1.0", nil)
+	req.Header.Set("Accept", MediaTypeDockerManifest)
+	p.ServeManifest(rec, req, "library/alpine", "1.0")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manifest 状态码 = %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/alpine/blobs/"+blobDigest, nil), "library/alpine", blobDigest)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("blob 状态码 = %d", rec.Code)
+	}
+
+	items := p.Activity().List(0)
+	if len(items) != 2 {
+		t.Fatalf("记录条数 = %d, 期望 2: %+v", len(items), items)
+	}
+	blobRec := items[0]
+	if blobRec.Kind != activity.KindBlob || blobRec.State != activity.StateDone {
+		t.Errorf("最新记录 = %+v", blobRec)
+	}
+	if blobRec.Upstream != "fake" || blobRec.Group != "test" {
+		t.Errorf("上游/分组 = %q/%q", blobRec.Upstream, blobRec.Group)
+	}
+	if blobRec.Bytes != int64(len(blob)) {
+		t.Errorf("记录字节 = %d, 期望 %d", blobRec.Bytes, len(blob))
+	}
+	if blobRec.Reference != shortDigest(blobDigest) {
+		t.Errorf("引用 = %q", blobRec.Reference)
+	}
+
+	manifestRec := items[1]
+	if manifestRec.Kind != activity.KindManifest || manifestRec.Reference != "1.0" {
+		t.Errorf("manifest 记录 = %+v", manifestRec)
+	}
+	if manifestRec.Bytes != int64(len(manifestBody)) {
+		t.Errorf("manifest 字节 = %d", manifestRec.Bytes)
+	}
+	if manifestRec.State != activity.StateDone {
+		t.Errorf("manifest 状态 = %s", manifestRec.State)
+	}
+
+	// 再拉一次全部命中缓存，应记为 cached。
+	// 注意：manifest 缓存键包含 Accept 分类，这里要带同样的 Accept 才会命中。
+	hitReq := httptest.NewRequest(http.MethodGet, "/v2/library/alpine/manifests/1.0", nil)
+	hitReq.Header.Set("Accept", MediaTypeDockerManifest)
+	rec = httptest.NewRecorder()
+	p.ServeManifest(rec, hitReq, "library/alpine", "1.0")
+	if got := rec.Header().Get("X-Mirror-Gateway-Cache"); got != "hit" {
+		t.Fatalf("第二次 manifest 缓存状态 = %q", got)
+	}
+	rec = httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/alpine/blobs/"+blobDigest, nil), "library/alpine", blobDigest)
+	items = p.Activity().List(0)
+	if items[0].State != activity.StateCached || items[1].State != activity.StateCached {
+		t.Errorf("缓存命中未记录: %s / %s", items[0].State, items[1].State)
+	}
+
+	sum2 := p.Activity().Summary()
+	if sum2.Total != 4 || sum2.Cached != 2 {
+		t.Errorf("汇总 = %+v", sum2)
+	}
+}

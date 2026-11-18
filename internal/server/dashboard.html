@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Mirror Gateway · 镜像代理控制台</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --border: #e3e6ea;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --ok: #15803d;
+    --ok-bg: #e8f5ec;
+    --bad: #b91c1c;
+    --bad-bg: #fdecec;
+    --warn: #b45309;
+    --warn-bg: #fdf3e3;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px -12px rgba(16, 24, 40, .12);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 24px 56px; }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 18px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 38px; height: 38px; border-radius: 10px; flex: none;
+    background: linear-gradient(135deg, #2f6bff, #1e40af);
+    color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 16px;
+    box-shadow: 0 6px 16px -6px rgba(37, 99, 235, .8);
+  }
+  h1 { font-size: 19px; margin: 0; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .sub .dot { margin: 0 6px; opacity: .5; }
+  .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  input, button { font: inherit; }
+  .token {
+    width: 210px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: #fff; color: var(--text); outline: none;
+  }
+  .token:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+  button {
+    padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: #fff; color: var(--text); cursor: pointer; transition: .15s;
+  }
+  button:hover { border-color: #c9ced6; background: #fafbfc; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #1d4ed8; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .search-bar { display: flex; gap: 10px; padding: 14px 18px; }
+  .search-input {
+    flex: 1; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: #fff; color: var(--text); outline: none; font-size: 13px;
+  }
+  .search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+  .search-desc {
+    white-space: normal; color: var(--muted); min-width: 240px; max-width: 420px; line-height: 1.5;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  th.sortable .sort-arrow { margin-left: 4px; opacity: .35; font-size: 10px; }
+  th.sortable.sorted { color: var(--text); }
+  th.sortable.sorted .sort-arrow { opacity: 1; color: var(--accent); }
+  .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 15px 16px; box-shadow: var(--shadow);
+  }
+  .card .label { color: var(--muted); font-size: 12px; letter-spacing: .3px; display: flex; justify-content: space-between; gap: 8px; }
+  .card .value { font-size: 22px; font-weight: 650; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .card .value small { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+  .bar { height: 5px; border-radius: 99px; background: #eef0f3; margin-top: 10px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: linear-gradient(90deg, #60a5fa, #2563eb); border-radius: 99px; width: 0; transition: width .4s ease; }
+  /* 标签页 */
+  .tabs {
+    display: flex; align-items: center; gap: 2px; padding: 4px; margin-bottom: 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: var(--shadow); overflow-x: auto; position: sticky; top: 10px; z-index: 20;
+  }
+  .tab {
+    border: 0; background: transparent; padding: 8px 14px; border-radius: 8px; white-space: nowrap;
+    color: var(--muted); font-size: 13px; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .tab:hover { background: #f3f5f9; color: var(--text); border-color: transparent; }
+  .tab.active { background: #eaf0ff; color: #1d4ed8; }
+  .tab-count {
+    display: none; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+    background: #dbe4ff; color: #1d4ed8; font-size: 11px; place-items: center; font-variant-numeric: tabular-nums;
+  }
+  .tab-count.show { display: inline-grid; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: var(--shadow); overflow: hidden; margin-bottom: 18px;
+  }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--border); min-height: 46px; }
+  .panel-head h2 { margin: 0; font-size: 14.5px; letter-spacing: .2px; }
+  .panel-head .hint { color: var(--muted); font-size: 12px; }
+  .panel-head .toolbar { gap: 6px; }
+  .hint-line { padding: 0 18px 12px; color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 9px; border-bottom: 1px solid #eef0f3; white-space: nowrap; }
+  th { font-size: 11.5px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; background: #fbfcfd; }
+  tbody tr:hover { background: #fafbfd; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .rank { width: 28px; height: 22px; display: inline-grid; place-items: center; border-radius: 6px; background: #f1f3f6; color: var(--muted); font-size: 11.5px; font-weight: 600; }
+  .rank.top { background: #e8efff; color: #1d4ed8; }
+  .name { font-weight: 600; }
+  /* 搜索结果的镜像名是跳转到源仓库页面的链接 */
+  a.name { color: inherit; text-decoration: none; border-bottom: 1px dashed transparent; }
+  a.name:hover, a.name:focus-visible { color: var(--accent, #2563eb); border-bottom-color: currentColor; }
+  .url { color: var(--muted); font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  /* 上游镜像源：地址限宽省略，悬浮看全文，避免长地址把表格撑出横向滚动 */
+  .uurl {
+    display: inline-block; max-width: 210px; overflow: hidden; text-overflow: ellipsis;
+    vertical-align: middle; color: var(--muted); font-size: 12.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  /* 代理列的紧凑标识：env / socks5 / http，完整地址悬浮查看 */
+  .proxy-tag {
+    display: inline-block; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 600;
+    background: #f1f3f6; color: #6b7280; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .soft { color: var(--muted); font-weight: 400; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 99px; font-size: 12px; font-weight: 600; }
+  .badge i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .badge.ok { color: var(--ok); background: var(--ok-bg); }
+  .badge.bad { color: var(--bad); background: var(--bad-bg); }
+  .badge.warn { color: var(--warn); background: var(--warn-bg); }
+  .num { font-variant-numeric: tabular-nums; }
+  /* 搜索结果的版本号：等宽数字，一眼看出哪个仓库的 latest 更新 */
+  .ver {
+    display: inline-block; padding: 2px 7px; border-radius: 6px;
+    background: #f1f3f6; color: #374151; font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  .center { text-align: center; }
+  /* 上游镜像源：最近错误只留图标，完整内容走悬浮提示 */
+  .err-tip {
+    display: inline-grid; place-items: center; width: 21px; height: 21px; border-radius: 50%;
+    color: var(--bad); background: var(--bad-bg); cursor: help; outline: none; vertical-align: middle;
+  }
+  .err-tip:hover, .err-tip:focus-visible { background: #fadada; box-shadow: 0 0 0 3px rgba(185, 28, 28, .08); }
+  .err-tip svg { width: 13px; height: 13px; display: block; }
+  #tip {
+    position: fixed; z-index: 90; display: none; max-width: 460px; padding: 9px 11px;
+    background: #111827; color: #f3f4f6; border-radius: 8px; font-size: 12px; line-height: 1.55;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    box-shadow: 0 12px 30px -8px rgba(16, 24, 40, .45); pointer-events: none;
+  }
+  #tip.show { display: block; }
+  #tip .tip-head { display: block; color: #fca5a5; font-size: 11px; font-weight: 700; letter-spacing: .4px; margin-bottom: 3px; }
+  /* 上游镜像源：分组子标签 */
+  .subtabs {
+    display: flex; align-items: center; gap: 6px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); background: #fcfdfe; overflow-x: auto;
+  }
+  .subtabs:empty { display: none; }
+  .subtab {
+    padding: 4px 11px; border-radius: 99px; border: 1px solid var(--border); background: #fff;
+    color: var(--muted); font-size: 12.5px; font-weight: 600; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .subtab:hover { background: #f7f9fc; color: var(--text); }
+  .subtab.active { background: #eaf0ff; border-color: #c7d7ff; color: #1d4ed8; }
+  .subtab .n { font-size: 11px; font-variant-numeric: tabular-nums; color: #9aa3af; }
+  .subtab.active .n { color: #4f74e8; }
+  .subtab .dot-bad { width: 6px; height: 6px; border-radius: 50%; background: var(--bad); }
+  /* 选中具体分组时，组内的分组 chip 已无信息量，藏起来给地址留空间 */
+  table.by-group .group-chip { display: none; }
+  .empty { padding: 34px 18px; text-align: center; color: var(--muted); }
+  .code {
+    position: relative; margin: 0; padding: 14px 16px; background: #0f172a; color: #d7e3f4;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.6;
+    overflow-x: auto;
+  }
+  .code .k { color: #7dd3fc; }
+  .code .s { color: #a5f3b0; }
+  .mini { margin-left: 10px; padding: 4px 10px; font-size: 12px; }
+  .chip {
+    display: inline-block; margin: 1px 4px 1px 0; padding: 1px 7px; border-radius: 6px;
+    background: #f1f3f6; color: #4b5563; font-size: 11.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .wrapcell { white-space: normal; max-width: 330px; line-height: 1.9; }
+  /* 拉取监控 */
+  .cell-sub {
+    display: block; margin-top: 2px; color: var(--muted); font-size: 11.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .soft { color: var(--muted); font-weight: 400; }
+  .live-speed { color: #1d4ed8; font-weight: 650; }
+  footer { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+  .banner { display: none; margin-bottom: 16px; padding: 11px 14px; border-radius: 10px; background: var(--warn-bg); color: var(--warn); border: 1px solid #f3ddb7; font-size: 13px; }
+  .banner.show { display: block; }
+  .pulse { animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+  @media (max-width: 900px) {
+    .cards { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    .wrap { padding: 20px 14px 40px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="logo">M</div>
+      <div>
+        <h1>Docker Mirror Gateway</h1>
+        <div class="sub">
+          <span id="version">v-</span><span class="dot">·</span><span id="uptime">运行中</span><span class="dot">·</span><span id="strategy">策略 -</span><span class="dot">·</span><span id="listen">端口 -</span>
+        </div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <input id="token" class="token" type="password" placeholder="管理令牌（未开启可留空）" autocomplete="off" hidden>
+      <button id="probe-all">全部探测</button>
+      <button id="gc">清理缓存</button>
+      <button id="refresh" class="primary">刷新</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner"></div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">上游健康</div>
+      <div class="value"><span id="health-value">-</span><small id="health-sub"></small></div>
+      <div class="bar"><i id="health-bar"></i></div>
+    </div>
+    <div class="card">
+      <div class="label">进行中的拉取</div>
+      <div class="value"><span id="active-value">0</span><small id="active-speed"></small></div>
+    </div>
+    <div class="card">
+      <div class="label">累计出站流量</div>
+      <div class="value" id="bytes-served">-</div>
+    </div>
+    <div class="card">
+      <div class="label"><span>缓存占用</span><span id="hitrate"></span></div>
+      <div class="value"><span id="cache-size">-</span><small id="cache-max"></small></div>
+      <div class="bar"><i id="cache-bar"></i></div>
+    </div>
+  </div>
+
+  <nav class="tabs" id="tabs" role="tablist">
+    <button class="tab active" data-tab="pulls" role="tab">拉取监控<span class="tab-count" id="pull-count">0</span></button>
+    <button class="tab" data-tab="search" role="tab">镜像搜索</button>
+    <button class="tab" data-tab="upstreams" role="tab">上游镜像源</button>
+    <button class="tab" data-tab="routes" role="tab">分组与路由</button>
+    <button class="tab" data-tab="usage" role="tab">接入方式</button>
+  </nav>
+
+  <section class="panel tab-panel active" data-panel="pulls">
+    <div class="panel-head">
+      <div class="hint" id="pulls-hint">最近 100 条拉取记录，进行中的排在最上面</div>
+      <div class="toolbar">
+        <button id="pull-filter" class="mini">只看进行中</button>
+      </div>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:92px">时间</th>
+            <th>镜像</th>
+            <th style="width:64px">类型</th>
+            <th>源</th>
+            <th>分组</th>
+            <th class="num">大小</th>
+            <th class="num">速度</th>
+            <th class="num">耗时</th>
+            <th style="width:84px">状态</th>
+          </tr>
+        </thead>
+        <tbody id="pulls">
+          <tr><td colspan="9" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel tab-panel" data-panel="search">
+    <div class="search-bar">
+      <input id="search-input" class="search-input" type="search"
+             placeholder="搜索镜像名，例如 nginx、postgres、prometheus" autocomplete="off">
+      <button id="search-btn" class="primary">搜索</button>
+    </div>
+    <div class="hint-line">查询 Docker Hub、Quay 与 MCR；点表头排序，更新时间越新说明 latest 越活跃</div>
+    <div id="search-results"></div>
+  </section>
+
+  <section class="panel tab-panel" data-panel="upstreams">
+    <div class="panel-head">
+      <div class="hint" id="group-hint">加载中…</div>
+      <div class="hint">排序按当前选源策略实时计算</div>
+    </div>
+    <div class="subtabs" id="sub-tabs"></div>
+    <div style="overflow-x:auto">
+      <table id="upstream-table">
+        <thead>
+          <tr>
+            <th style="width:112px" id="upstream-group-th">分组</th>
+            <th>名称</th>
+            <th>地址</th>
+            <th style="width:76px">代理</th>
+            <th style="width:72px">状态</th>
+            <th style="width:88px">速度</th>
+            <th style="width:70px">延迟</th>
+            <th style="width:104px">用量</th>
+            <th style="width:44px" class="center">错误</th>
+            <th style="width:56px"></th>
+          </tr>
+        </thead>
+        <tbody id="upstreams">
+          <tr><td colspan="10" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel tab-panel" data-panel="routes">
+    <div class="panel-head">
+      <div class="hint" id="route-hint">加载中…</div>
+      <div class="toolbar"><button id="clear-routes" class="mini">清空路由缓存</button></div>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>分组</th>
+            <th>优先级</th>
+            <th>路径前缀 / 域名</th>
+            <th>健康</th>
+            <th>健康探针</th>
+          </tr>
+        </thead>
+        <tbody id="groups">
+          <tr><td colspan="5" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel tab-panel" data-panel="usage">
+    <div class="panel-head">
+      <div class="hint">Docker Hub 用 registry-mirrors；其他仓库用路径前缀</div>
+      <button id="copy" class="mini">复制</button>
+    </div>
+    <pre class="code" id="snippet"></pre>
+  </section>
+
+  <footer>
+    <span>状态每 5 秒刷新 · 拉取监控每 1.2 秒刷新 · 只保留最近 100 条</span>
+    <span id="updated">-</span>
+  </footer>
+</div>
+
+<div id="tip" role="tooltip"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TOKEN_KEY = 'docker-mirror-gateway.admin.token';
+const TABS = ['pulls', 'search', 'upstreams', 'routes', 'usage'];
+
+$('token').value = localStorage.getItem(TOKEN_KEY) || '';
+$('token').addEventListener('change', () => {
+  localStorage.setItem(TOKEN_KEY, $('token').value.trim());
+  refresh();
+  loadActivity();
+});
+
+function human(bytes) {
+  if (!bytes || bytes < 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = bytes;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + ' ' + units[i];
+}
+
+function rate(bps) {
+  if (!bps || bps <= 0) return '—';
+  const kb = bps / 1024;
+  if (kb >= 1024) return (kb / 1024).toFixed(1) + ' MB/s';
+  if (kb >= 1) return kb.toFixed(0) + ' KB/s';
+  return Math.round(bps) + ' B/s';
+}
+
+// 速度列：没有样本时显示占位并说明原因，有样本时快源加粗。
+function rateCell(bps, samples) {
+  if (!bps || bps <= 0) {
+    return `<span style="color:#9ca3af" title="还没有吞吐样本：等后台探测，或发生一次真实拉取">${samples > 0 ? '—' : '待测'}</span>`;
+  }
+  const txt = rate(bps);
+  return bps >= 2 * 1024 * 1024
+    ? `<span style="font-weight:600">${txt}</span>`
+    : txt;
+}
+
+function uptime(sec) {
+  sec = Math.floor(sec || 0);
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  if (d > 0) return `已运行 ${d} 天 ${h} 小时`;
+  if (h > 0) return `已运行 ${h} 小时 ${m} 分`;
+  return `已运行 ${m} 分钟`;
+}
+
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---------- 悬浮提示 ----------
+// 表格容器是 overflow:auto，绝对定位的提示会被裁掉，所以统一用 fixed 层跟随光标位置。
+const tipEl = $('tip');
+let tipTarget = null;
+
+function showTip(el) {
+  const text = el.dataset.tip;
+  if (!text) return;
+  tipTarget = el;
+  const head = el.dataset.tipHead;
+  tipEl.innerHTML = (head ? `<span class="tip-head">${esc(head)}</span>` : '') + esc(text);
+  tipEl.classList.add('show');
+
+  const r = el.getBoundingClientRect();
+  const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.min(Math.max(8, left), window.innerWidth - tw - 8);
+  let top = r.bottom + 8;
+  if (top + th > window.innerHeight - 8) top = r.top - th - 8;
+  tipEl.style.left = Math.round(left) + 'px';
+  tipEl.style.top = Math.round(Math.max(8, top)) + 'px';
+}
+
+function hideTip() {
+  tipTarget = null;
+  tipEl.classList.remove('show');
+}
+
+document.addEventListener('mouseover', (e) => {
+  const el = e.target.closest && e.target.closest('[data-tip]');
+  if (el) showTip(el);
+});
+document.addEventListener('mouseout', (e) => {
+  if (!tipTarget) return;
+  if (!e.relatedTarget || !tipTarget.contains(e.relatedTarget)) hideTip();
+});
+document.addEventListener('focusin', (e) => {
+  const el = e.target.closest && e.target.closest('[data-tip]');
+  if (el) showTip(el); else hideTip();
+});
+document.addEventListener('focusout', hideTip);
+document.addEventListener('scroll', hideTip, true);
+window.addEventListener('resize', hideTip);
+
+function relTime(iso) {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '';
+  const diff = Math.max(0, (Date.now() - t) / 1000);
+  if (diff < 5) return '刚刚';
+  if (diff < 60) return Math.floor(diff) + ' 秒前';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  if (diff < 86400 * 30) return Math.floor(diff / 86400) + ' 天前';
+  if (diff < 86400 * 365) return Math.floor(diff / 86400 / 30) + ' 个月前';
+  return Math.floor(diff / 86400 / 365) + ' 年前';
+}
+
+let bannerUntil = 0;
+// banner 默认随下一次状态刷新消失；holdMs 让提示停留一会儿。
+function banner(msg, holdMs = 0) {
+  const el = $('banner');
+  el.textContent = msg || '';
+  el.classList.toggle('show', !!msg);
+  bannerUntil = msg && holdMs > 0 ? Date.now() + holdMs : 0;
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  const token = ($('token').value || '').trim();
+  if (token) headers['X-Admin-Token'] = token;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  if (res.status === 401) {
+    banner('该接口需要管理令牌，请在右上角输入与 server.adminToken 一致的值。');
+    throw new Error('unauthorized');
+  }
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+// ---------- 标签页 ----------
+let currentTab = 'pulls';
+
+function setTab(name, opts = {}) {
+  if (!TABS.includes(name)) name = 'pulls';
+  currentTab = name;
+  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.panel === name));
+  if (opts.hash !== false) {
+    const url = new URL(location.href);
+    url.hash = name === 'pulls' ? '' : name;
+    history.replaceState(null, '', url);
+  }
+  if (name === 'pulls') loadActivity();
+  if (name === 'search') $('search-input').focus();
+}
+
+$('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab');
+  if (btn) setTab(btn.dataset.tab);
+});
+
+// ---------- 拉取监控 ----------
+let pulls = [];
+let pullsOnlyActive = false;
+
+function pullRow(it) {
+  const active = it.state === 'active';
+  const badge = {
+    active: '<span class="badge warn pulse"><i></i>拉取中</span>',
+    done: '<span class="badge ok"><i></i>完成</span>',
+    cached: '<span class="badge ok"><i></i>缓存</span>',
+    failed: `<span class="badge bad" title="${esc(it.error || '')}"><i></i>失败</span>`,
+  }[it.state] || `<span class="badge">${esc(it.state)}</span>`;
+
+  const kind = it.kind === 'manifest' ? '<span class="chip">清单</span>' : '<span class="chip">层</span>';
+  let source;
+  if (it.state === 'cached' && !it.upstream) {
+    source = '<span class="chip">本地缓存</span>';
+  } else if (it.upstream) {
+    source = `<span class="chip">${esc(it.upstream)}</span>`;
+  } else {
+    source = '<span class="soft">—</span>';
+  }
+
+  const size = it.total > 0 && it.total !== it.bytes
+    ? `${human(it.bytes)} <span class="soft">/ ${human(it.total)}</span>`
+    : human(it.bytes);
+
+  let speed = '<span class="soft">—</span>';
+  if (it.speedBps > 0) {
+    speed = active ? `<span class="live-speed">${rate(it.speedBps)}</span>` : rate(it.speedBps);
+  }
+
+  const when = new Date(it.startedAt);
+  const dur = it.durationMs >= 1000
+    ? (it.durationMs / 1000).toFixed(1) + 's'
+    : Math.max(1, it.durationMs) + 'ms';
+  const title = `${when.toLocaleString()} · 耗时 ${(it.durationMs / 1000).toFixed(2)}s${it.error ? ' · ' + it.error : ''}`;
+
+  return `<tr>
+    <td class="num" title="${esc(title)}">${esc(relTime(it.startedAt))}</td>
+    <td><span class="name">${esc(it.repo)}</span><span class="cell-sub">${esc(it.reference || '')}</span></td>
+    <td>${kind}</td>
+    <td>${source}</td>
+    <td>${it.group ? `<span class="chip">${esc(it.group)}</span>` : '<span class="soft">—</span>'}</td>
+    <td class="num">${size}</td>
+    <td class="num">${speed}</td>
+    <td class="num">${dur}${active ? '<span class="soft">…</span>' : ''}</td>
+    <td>${badge}</td>
+  </tr>`;
+}
+
+function renderPulls() {
+  const tbody = $('pulls');
+  const list = pullsOnlyActive ? pulls.filter((it) => it.state === 'active') : pulls;
+  if (!list.length) {
+    tbody.innerHTML = pullsOnlyActive
+      ? '<tr><td colspan="9" class="empty">当前没有进行中的拉取</td></tr>'
+      : '<tr><td colspan="9" class="empty">还没有拉取记录，执行一次 docker pull 后这里会实时出现</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map(pullRow).join('');
+}
+
+// 只更新顶部卡片与标签角标：不在拉取页时也能看到「有几个在拉」。
+function renderActivityCounters(d) {
+  const sum = d.summary || {};
+  const active = sum.active || 0;
+  $('active-value').textContent = active;
+  $('active-speed').textContent = active > 0 ? '· ' + rate(sum.speedBps) : '';
+  const badge = $('pull-count');
+  badge.textContent = active;
+  badge.classList.toggle('show', active > 0);
+}
+
+function renderActivity(d) {
+  pulls = d.items || [];
+  const sum = d.summary || {};
+  const active = sum.active || 0;
+  renderActivityCounters(d);
+
+  const parts = [`进行中 ${active}`];
+  if (sum.done) parts.push(`完成 ${sum.done}`);
+  if (sum.cached) parts.push(`缓存 ${sum.cached}`);
+  if (sum.failed) parts.push(`失败 ${sum.failed}`);
+  parts.push(`共保留 ${sum.total || 0} 条（上限 100）`);
+  $('pulls-hint').textContent = parts.join(' · ');
+
+  renderPulls();
+}
+
+// background=true 时只取汇总（limit=1）刷新角标，用于不在拉取页时的低频轮询。
+async function loadActivity(opts = {}) {
+  const background = !!opts.background;
+  if (document.hidden) return;
+  if (currentTab !== 'pulls' && !background) return;
+  try {
+    const d = await api('/api/v1/activity?limit=' + (background ? 1 : 100));
+    // 全量请求已经在路上时，别让汇总把列表覆盖成一条。
+    if (background && currentTab === 'pulls') return;
+    if (background) {
+      renderActivityCounters(d);
+    } else {
+      renderActivity(d);
+    }
+  } catch (e) { /* 令牌/网络问题由 banner 提示，监控面板保持上一帧 */ }
+}
+
+$('pull-filter').addEventListener('click', () => {
+  pullsOnlyActive = !pullsOnlyActive;
+  const btn = $('pull-filter');
+  btn.textContent = pullsOnlyActive ? '显示全部' : '只看进行中';
+  btn.classList.toggle('primary', pullsOnlyActive);
+  renderPulls();
+});
+
+// ---------- 状态 ----------
+let lastStatus = null;
+
+function render(s) {
+  lastStatus = s;
+  const r = s.routing || {};
+  $('version').textContent = 'v' + s.version;
+  $('uptime').textContent = uptime(s.uptimeSeconds);
+  const selectText = s.selection.strategy === 'latency' ? '低延迟优先'
+    : s.selection.strategy === 'priority' ? '优先级优先'
+    : '下载速度优先';
+  $('strategy').textContent = `选源：${selectText} · 路由：${r.autoDetect ? '自动判定' : '兜底分组'}`;
+
+  const l = s.listen || {};
+  $('listen').textContent = l.adminSplit
+    ? `拉取 ${l.pullAddr} · 管理 ${l.adminAddr}`
+    : `单端口 ${l.pullAddr}`;
+  $('listen').title = l.adminAuth ? '管理接口已启用令牌校验' : '管理接口未设置 adminToken，请限制访问来源';
+  // 未配置 server.adminToken 时不需要令牌输入框，直接收起。
+  $('token').hidden = !l.adminAuth;
+  renderSnippet(s);
+  $('group-hint').textContent = `${(s.groups || []).length} 个分组 · ${s.upstreams.length} 个镜像源 · ${s.totals.healthyUpstreams} 个健康`;
+  $('route-hint').textContent = r.autoDetect
+    ? `自动路由：开（${r.strategy === 'fastest' ? '最快响应优先' : '分组优先级优先'}）· 已缓存 ${r.cachedRoutes || 0} 条判定`
+    : `自动路由：关 · 未匹配时使用兜底分组 ${r.defaultGroup || '-'}`;
+
+  // 顶部卡片
+  const healthy = s.totals.healthyUpstreams || 0;
+  const totalUp = s.totals.totalUpstreams || 0;
+  $('health-value').textContent = `${healthy}/${totalUp}`;
+  $('health-sub').textContent = healthy === totalUp ? '全部可用' : `${totalUp - healthy} 个不可用`;
+  $('health-bar').style.width = totalUp > 0 ? (healthy / totalUp * 100).toFixed(1) + '%' : '0%';
+
+  const cacheOff = !!(s.cache && s.cache.enabled === false);
+  const size = s.cache.sizeBytes || 0, max = s.cache.maxBytes || 0;
+  if (cacheOff) {
+    $('cache-size').textContent = '未启用';
+    $('cache-max').textContent = '';
+    $('cache-bar').style.width = '0%';
+    $('hitrate').textContent = '命中 —';
+    $('gc').disabled = true;
+  } else {
+    $('cache-size').textContent = human(size);
+    $('cache-max').textContent = max > 0 ? '/ ' + human(max) : '';
+    $('cache-bar').style.width = max > 0 ? Math.min(100, size / max * 100).toFixed(1) + '%' : '0%';
+    const hits = s.totals.cacheHits || 0, misses = s.totals.cacheMisses || 0;
+    $('hitrate').textContent = hits + misses > 0 ? `命中 ${(hits / (hits + misses) * 100).toFixed(0)}%` : '命中 —';
+    $('gc').disabled = false;
+  }
+  $('bytes-served').textContent = human(s.totals.bytesServed);
+
+  const chips = (list) => {
+    if (!list || !list.length) return '';
+    const shown = list.slice(0, 4).map((v) => `<span class="chip">${esc(v)}</span>`).join('');
+    return shown + (list.length > 4 ? `<span class="chip">+${list.length - 4}</span>` : '');
+  };
+  $('groups').innerHTML = (s.groups || []).map((g) => `<tr>
+    <td><span class="name">${esc(g.name)}</span>${g.default ? ' <span class="badge ok"><i></i>兜底</span>' : ''}</td>
+    <td class="num">${g.priority}</td>
+    <td class="wrapcell">${chips((g.aliases || []).filter((a) => !(g.hosts || []).includes(a))) || '<span style="color:#9ca3af">—</span>'}${(g.hosts || []).length ? '<br>' + chips(g.hosts) : ''}</td>
+    <td class="num">${g.healthyUpstreams}/${g.totalUpstreams}</td>
+    <td><span class="url">${esc(g.probeRepo || '仅探测 /v2/')}${g.probeTag ? ':' + esc(g.probeTag) : ''}</span></td>
+  </tr>`).join('') || '<tr><td colspan="5" class="empty">尚未配置分组</td></tr>';
+
+  const proxyCell = (p) => {
+    if (!p || p === 'env') return '<span class="proxy-tag" data-tip="该上游未配置代理，走系统环境变量">env</span>';
+    if (p === 'direct') return '<span class="proxy-tag" data-tip="显式配置为不走代理">直连</span>';
+    // socks5://127.0.0.1:17891 -> 只留协议名，完整地址悬浮查看。
+    const scheme = p.split('://')[0] || 'proxy';
+    return `<span class="proxy-tag" data-tip="${esc(p)}" data-tip-head="代理地址">${esc(scheme)}</span>`;
+  };
+
+  const table = $('upstream-table');
+  // 先渲染子标签：分组被删掉时它会重置 upstreamGroup，再决定是否收起分组 chip。
+  renderUpstreamTabs(s.upstreams);
+  table.classList.toggle('by-group', !!upstreamGroup);
+  // 合并后的第一列在全部视图里叫「分组」，选中某个分组后叫「组内」。
+  $('upstream-group-th').textContent = upstreamGroup ? '组内' : '分组';
+
+  const list = upstreamGroup ? s.upstreams.filter((u) => (u.group || '') === upstreamGroup) : s.upstreams;
+  const tbody = $('upstreams');
+  if (!list.length) {
+    tbody.innerHTML = `<tr><td colspan="10" class="empty">${s.upstreams.length ? '该分组下没有镜像源' : '尚未配置上游镜像源'}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = list.map((u) => {
+    const healthyUp = u.healthy;
+    const badge = healthyUp
+      ? (u.consecutiveFailures > 0
+        ? '<span class="badge warn"><i></i>降级</span>'
+        : '<span class="badge ok"><i></i>可用</span>')
+      : '<span class="badge bad"><i></i>不可用</span>';
+    const rank = u.rank <= 3 && healthyUp ? 'rank top' : 'rank';
+    const usage = `${(u.requests || 0).toLocaleString()} 次 · ${human(u.bytesServed)}`;
+    return `<tr>
+      <td><span class="${rank}" title="配置优先级 ${esc(String(u.priority))} · 名次按当前选源策略实时计算">${u.rank}</span> <span class="chip group-chip">${esc(u.group || '')}</span></td>
+      <td><span class="name" title="${esc(u.name)} · 优先级 ${esc(String(u.priority))}">${esc(u.name)}</span></td>
+      <td><span class="uurl" data-tip="${esc(u.url)}" data-tip-head="完整地址">${esc(u.url)}</span></td>
+      <td>${proxyCell(u.proxy)}</td>
+      <td>${badge}</td>
+      <td class="num">${rateCell(u.speedBps, u.speedSamples)}</td>
+      <td class="num">${u.latencyMs > 0 ? u.latencyMs.toFixed(0) + ' ms' : '—'}</td>
+      <td class="num" title="请求 ${(u.requests || 0).toLocaleString()} 次 · 累计出站 ${human(u.bytesServed)}">${usage}</td>
+      <td class="center">${errCell(u.lastError)}</td>
+      <td><button data-probe="${esc(u.name)}">探测</button></td>
+    </tr>`;
+  }).join('');
+
+  // 表格每 5 秒重绘一次，鼠标停在图标上时节点可能被换掉，顺手收掉悬挂的提示。
+  if (tipTarget && !tipTarget.isConnected) hideTip();
+
+  tbody.querySelectorAll('button[data-probe]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true; btn.textContent = '探测中';
+      try { await api('/api/v1/upstreams/' + encodeURIComponent(btn.dataset.probe) + '/probe', { method: 'POST' }); }
+      catch (e) { /* banner 已提示 */ }
+      await refresh();
+    });
+  });
+}
+
+// ---------- 上游镜像源分组子标签 ----------
+const UPSTREAM_GROUP_KEY = 'docker-mirror-gateway.upstream.group';
+let upstreamGroup = localStorage.getItem(UPSTREAM_GROUP_KEY) || '';
+
+const WARN_ICON = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.9 14.9 14.1H1.1L8 1.9Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="M8 6.1v3.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="11.9" r=".8" fill="currentColor"/></svg>';
+
+function errCell(msg) {
+  if (!msg) return '<span class="soft">—</span>';
+  return `<span class="err-tip" data-tip="${esc(msg)}" data-tip-head="最近一次错误" tabindex="0" aria-label="查看最近错误">${WARN_ICON}</span>`;
+}
+
+function renderUpstreamTabs(list) {
+  const counts = new Map();
+  const unhealthy = new Map();
+  list.forEach((u) => {
+    const g = u.group || '';
+    counts.set(g, (counts.get(g) || 0) + 1);
+    if (!u.healthy) unhealthy.set(g, (unhealthy.get(g) || 0) + 1);
+  });
+  // 分组被删掉/改名后别卡在一个空标签上。
+  if (upstreamGroup && !counts.has(upstreamGroup)) upstreamGroup = '';
+
+  const tabs = [`<button class="subtab${upstreamGroup === '' ? ' active' : ''}" data-group="">全部<span class="n">${list.length}</span></button>`];
+  counts.forEach((n, g) => {
+    const bad = unhealthy.get(g) || 0;
+    const dot = bad ? `<span class="dot-bad" title="${bad} 个不可用"></span>` : '';
+    tabs.push(`<button class="subtab${upstreamGroup === g ? ' active' : ''}" data-group="${esc(g)}">${esc(g)}<span class="n">${n}</span>${dot}</button>`);
+  });
+  $('sub-tabs').innerHTML = tabs.join('');
+}
+
+$('sub-tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.subtab');
+  if (!btn) return;
+  const next = btn.dataset.group || '';
+  if (next === upstreamGroup) return;
+  upstreamGroup = next;
+  localStorage.setItem(UPSTREAM_GROUP_KEY, next);
+  hideTip();
+  if (lastStatus) render(lastStatus);
+});
+
+// ---------- 镜像搜索 ----------
+let searchResults = [];
+let searchView = [];
+let searchErrors = [];
+// 默认保持服务端的「官方 / 热度」顺序，点表头才切换成显式排序。
+let searchSort = { key: '', dir: -1 };
+
+function pullCommand(item) {
+  const origin = pullOrigin(lastStatus);
+  const groups = (lastStatus && lastStatus.groups) || [];
+  const grp = groups.find((g) => g.name === item.group);
+  const alias = grp && (grp.aliases || [])[0];
+  const usePrefix = alias && !(grp && grp.default);
+  const prefix = usePrefix ? '/' + alias : '';
+  return `docker pull ${origin}${prefix}/${item.name}:latest`;
+}
+
+// versionParts 把 1.27.3-alpine 解析成 [1,27,3]；不是版本号返回 null。
+function versionParts(tag) {
+  const m = /^v?(\d+(?:\.\d+)+)/i.exec(String(tag || ''));
+  return m ? m[1].split('.').map(Number) : null;
+}
+
+// compareVersion 逐段比较版本号，缺的段按 0 算；没有版本号的排在最后。
+function compareVersion(a, b) {
+  if (!a || !b) return a ? 1 : (b ? -1 : 0);
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a[i] || 0, y = b[i] || 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+function searchValue(r, key) {
+  switch (key) {
+    case 'name': return (r.name || '').toLowerCase();
+    case 'source': return (r.source || '').toLowerCase();
+    case 'stars': return r.stars || 0;
+    case 'pulls': return r.pulls || 0;
+    case 'updated': return r.updated ? Date.parse(r.updated) : 0;
+    default: return 0;
+  }
+}
+
+function sortedSearchResults() {
+  if (!searchSort.key) return searchResults;
+  const key = searchSort.key, dir = searchSort.dir;
+  return searchResults.slice().sort((a, b) => {
+    if (key === 'latestTag') {
+      return compareVersion(versionParts(a.latestTag), versionParts(b.latestTag)) * dir;
+    }
+    const av = searchValue(a, key), bv = searchValue(b, key);
+    if (av === bv) return 0;
+    return (av < bv ? -1 : 1) * dir;
+  });
+}
+
+function sortHeader(key, label, className) {
+  const active = searchSort.key === key;
+  const arrow = active ? (searchSort.dir > 0 ? '↑' : '↓') : '↕';
+  return `<th class="sortable${active ? ' sorted' : ''}${className ? ' ' + className : ''}" data-sort="${key}">${label}<span class="sort-arrow">${arrow}</span></th>`;
+}
+
+function renderSearch(data) {
+  const box = $('search-results');
+  searchResults = data.results || [];
+  searchErrors = data.errors || [];
+  if (!searchResults.length) {
+    const err = searchErrors.join('；');
+    box.innerHTML = `<div class="empty" style="padding:18px;color:var(--muted)">没有找到结果${err ? '（' + esc(err) + '）' : ''}</div>`;
+    return;
+  }
+  searchView = sortedSearchResults();
+  const rows = searchView.map((r, i) => {
+    const nameHtml = r.url
+      ? `<a class="name" href="${esc(r.url)}" target="_blank" rel="noopener" title="在 ${esc(r.source)} 上查看">${esc(r.name)}</a>`
+      : `<span class="name">${esc(r.name)}</span>`;
+    const verHtml = r.latestTag
+      ? `<span class="ver" tabindex="0" data-tip-head="最近更新的版本"${
+          r.recentTags && r.recentTags.length ? ` data-tip="${esc(r.recentTags.join('\n'))}"` : ''
+        }>${esc(r.latestTag)}</span>`
+      : '<span style="color:#9ca3af">—</span>';
+    return `<tr>
+    <td>${nameHtml}${r.official ? ' <span class="badge ok"><i></i>官方</span>' : ''}</td>
+    <td><div class="search-desc">${esc(r.description || '—')}</div></td>
+    <td><span class="chip">${esc(r.source)}</span></td>
+    <td class="num">${r.stars ? r.stars.toLocaleString() : '—'}</td>
+    <td class="num">${r.pulls ? human(r.pulls) : '—'}</td>
+    <td>${verHtml}</td>
+    <td class="num" title="${esc(r.updated || '')}">${r.updated ? esc(relTime(r.updated)) : '—'}</td>
+    <td><button data-copy="${i}">复制命令</button></td>
+  </tr>`;
+  }).join('');
+  const errors = searchErrors.length
+    ? `<div style="padding:10px 18px;color:var(--muted);font-size:12px">部分来源不可用：${esc(searchErrors.join('；'))}</div>`
+    : '';
+  box.innerHTML = `<div style="overflow-x:auto"><table><thead><tr>
+      ${sortHeader('name', '镜像')}<th>描述</th>${sortHeader('source', '来源')}${sortHeader('stars', 'Star', 'num')}${sortHeader('pulls', '拉取量', 'num')}${sortHeader('latestTag', '最新版本')}${sortHeader('updated', '更新时间', 'num')}<th></th>
+    </tr></thead><tbody>${rows}</tbody></table></div>${errors}`;
+  box.querySelectorAll('th[data-sort]').forEach((th) => {
+    th.addEventListener('click', () => {
+      const key = th.dataset.sort;
+      if (searchSort.key === key) {
+        searchSort.dir = -searchSort.dir;
+      } else {
+        // 文本列先正序，数值/时间列先倒序（最大的、最新的在前）。
+        searchSort = { key, dir: (key === 'name' || key === 'source') ? 1 : -1 };
+      }
+      renderSearch({ results: searchResults, errors: searchErrors });
+    });
+  });
+  box.querySelectorAll('button[data-copy]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const cmd = pullCommand(searchView[Number(btn.dataset.copy)]);
+      try {
+        await navigator.clipboard.writeText(cmd);
+        btn.textContent = '已复制';
+        setTimeout(() => { btn.textContent = '复制命令'; }, 1500);
+      } catch (e) {
+        window.prompt('复制下面的命令：', cmd);
+      }
+    });
+  });
+}
+
+async function doSearch() {
+  const q = ($('search-input').value || '').trim();
+  const box = $('search-results');
+  if (!q) { box.innerHTML = ''; return; }
+  box.innerHTML = '<div style="padding:18px;color:var(--muted);font-size:13px">搜索中…</div>';
+  $('search-btn').disabled = true;
+  try {
+    const data = await api('/api/v1/search?q=' + encodeURIComponent(q) + '&limit=20');
+    renderSearch(data);
+  } catch (e) {
+    box.innerHTML = `<div style="padding:18px;color:var(--muted);font-size:13px">搜索失败：${esc(e.message)}</div>`;
+  } finally {
+    $('search-btn').disabled = false;
+  }
+}
+
+$('search-btn').addEventListener('click', doSearch);
+$('search-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+
+async function refresh() {
+  try {
+    const s = await api('/api/v1/status');
+    if (Date.now() > bannerUntil) banner('');
+    render(s);
+    $('updated').textContent = '最近更新 ' + new Date().toLocaleTimeString();
+    // 不在拉取页时，跟着状态刷新一起低频更新角标。
+    if (currentTab !== 'pulls') loadActivity({ background: true });
+  } catch (e) {
+    $('updated').textContent = '更新失败：' + e.message;
+  }
+}
+
+$('refresh').addEventListener('click', () => { refresh(); loadActivity(); });
+
+$('probe-all').addEventListener('click', async (ev) => {
+  if (!lastStatus) return;
+  ev.target.disabled = true;
+  try {
+    for (const u of lastStatus.upstreams) {
+      await api('/api/v1/upstreams/' + encodeURIComponent(u.name) + '/probe', { method: 'POST' }).catch(() => {});
+    }
+  } finally {
+    ev.target.disabled = false;
+    refresh();
+  }
+});
+
+$('gc').addEventListener('click', async (ev) => {
+  ev.target.disabled = true;
+  try {
+    const r = await api('/api/v1/cache/gc', { method: 'POST' });
+    banner(`缓存清理完成：删除 ${r.removed} 个文件，释放 ${human(r.freedBytes)}，当前占用 ${human(r.totalBytes)}。`, 6000);
+  } catch (e) { banner('清理失败：' + e.message, 6000); }
+  ev.target.disabled = false;
+  refresh();
+});
+
+$('clear-routes').addEventListener('click', async (ev) => {
+  ev.target.disabled = true;
+  try {
+    await api('/api/v1/routes', { method: 'DELETE' });
+    banner('路由判定缓存已清空，下次拉取会重新判定归属分组。', 5000);
+  } catch (e) { banner('清空失败：' + e.message, 6000); }
+  ev.target.disabled = false;
+  refresh();
+});
+
+// pullOrigin 返回镜像拉取端口的对外地址：
+// 优先用 server.publicURL，否则按 server.addr 的端口 + 当前访问域名推导。
+function pullOrigin(s) {
+  const l = (s && s.listen) || {};
+  if (l.pullUrl) return l.pullUrl.replace(/\/$/, '');
+  const addr = (l.pullAddr || '').trim();
+  let port = '';
+  if (addr.startsWith(':')) port = addr.slice(1);
+  else if (addr.includes(':')) port = addr.slice(addr.lastIndexOf(':') + 1);
+  if (!port || port === location.port) return location.origin;
+  return location.protocol + '//' + location.hostname + ':' + port;
+}
+
+function snippetText() {
+  const origin = pullOrigin(lastStatus);
+  const host = origin.replace(/^https?:\/\//, '');
+  return `# 1) Docker Hub 加速（/etc/docker/daemon.json）
+{
+  "registry-mirrors": ["${origin}"],
+  "insecure-registries": ["${host}"]
+}
+
+# 2) 其他仓库：用路径前缀显式指定（单域名即可）
+docker pull ${host}/ghcr.io/owner/app:latest
+docker pull ${host}/quay.io/org/app:latest
+docker pull ${host}/nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+
+# 3) 不带前缀时自动判定归属分组（结果会缓存）
+docker pull ${host}/library/nginx:latest
+docker pull ${host}/stefanprodan/podinfo:latest`;
+}
+
+function renderSnippet(s) {
+  $('snippet').textContent = snippetText(s);
+}
+
+$('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(snippetText()); $('copy').textContent = '已复制'; }
+  catch (e) { $('copy').textContent = '复制失败'; }
+  setTimeout(() => { $('copy').textContent = '复制'; }, 1500);
+});
+
+// ---------- 启动 ----------
+// 允许用 ?q=xxx 直接带出搜索结果，方便分享。
+const initialQuery = new URLSearchParams(location.search).get('q');
+const hashTab = location.hash.replace('#', '');
+if (initialQuery) {
+  $('search-input').value = initialQuery;
+  setTab('search');
+  doSearch();
+} else if (TABS.includes(hashTab)) {
+  setTab(hashTab);
+} else {
+  setTab('pulls', { hash: false });
+}
+
+renderSnippet();
+refresh();
+loadActivity();
+setInterval(refresh, 5000);
+setInterval(loadActivity, 1200);
+
+// 页面重新可见时立刻补一帧，避免标签页切回来看到旧数据。
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadActivity(); });
+</script>
+</body>
+</html>

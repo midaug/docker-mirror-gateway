@@ -1,0 +1,8 @@
+bin/
+data/
+*.log
+.DS_Store
+.idea/
+.vscode/
+.workbuddy/
+config.yaml

@@ -1,0 +1,60 @@
+# Docker Mirror Gateway 一键部署示例
+#
+#   docker compose up -d --build
+#   docker compose logs -f docker-mirror-gateway
+#
+# 启动后：
+#   镜像拉取    http://127.0.0.1:8080/v2/     （对局域网开放）
+#   控制台      http://127.0.0.1:8081/        （只映射到宿主机回环地址）
+#
+# 两个端口职责分离：拉取端口只提供 /v2/*，控制台与管理接口只走管理端口。
+#
+# 如需在宿主机上把它配置成 Docker 的镜像加速器，见 README 的「接入 Docker」一节。
+
+name: docker-mirror-gateway
+
+services:
+  docker-mirror-gateway:
+    build:
+      context: .
+      args:
+        VERSION: ${MIRROR_GATEWAY_VERSION:-dev}
+        # 国内网络取消下面这行注释
+        # GOPROXY: https://goproxy.cn,direct
+    image: docker-mirror-gateway:${MIRROR_GATEWAY_VERSION:-dev}
+    container_name: docker-mirror-gateway
+    restart: unless-stopped
+    command: ["-config", "/etc/docker-mirror-gateway/config.yaml"]
+    ports:
+      # 镜像拉取端口：需要对使用方开放
+      - "${MIRROR_GATEWAY_PORT:-8080}:8080"
+      # 管理端口：只绑定宿主机 127.0.0.1，避免后台暴露到网络
+      - "127.0.0.1:${MIRROR_GATEWAY_ADMIN_PORT:-8081}:8081"
+    environment:
+      MIRROR_GATEWAY_ADMIN_ADDR: ":8081"
+      # 缓存默认关闭；需要时把 .env 里的 MIRROR_GATEWAY_CACHE_ENABLED 设为 true
+      MIRROR_GATEWAY_CACHE_ENABLED: ${MIRROR_GATEWAY_CACHE_ENABLED:-false}
+      MIRROR_GATEWAY_CACHE_DIR: /var/lib/docker-mirror-gateway/cache
+      MIRROR_GATEWAY_CACHE_MAX_GB: ${MIRROR_GATEWAY_CACHE_MAX_GB:-50}
+      MIRROR_GATEWAY_LOG_LEVEL: ${MIRROR_GATEWAY_LOG_LEVEL:-info}
+      # 留空表示管理接口不校验令牌
+      MIRROR_GATEWAY_ADMIN_TOKEN: ${MIRROR_GATEWAY_ADMIN_TOKEN:-}
+    volumes:
+      # 配置文件以只读方式挂载，修改后重启容器生效
+      - ./config.yaml:/etc/docker-mirror-gateway/config.yaml:ro
+      # 缓存持久化，避免容器重建后重新回源；缓存关闭时这个卷不会写入
+      - docker-mirror-gateway-cache:/var/lib/docker-mirror-gateway
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  docker-mirror-gateway-cache:
