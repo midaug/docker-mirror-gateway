@@ -46,7 +46,26 @@ Docker / containerd ──▶ Docker Mirror Gateway ──┬──▶ dockerhub
 
 ## 快速开始
 
-### Docker Compose（推荐）
+### 安装
+
+无需自行编译，直接使用现成产物：
+
+- **二进制**：从 [Releases](https://github.com/midaug/docker-mirror-gateway/releases) 下载对应平台的压缩包，解压即用（提供 Linux amd64/arm64/armv7/386、macOS Intel/Apple Silicon、Windows x64/ARM64/x86）
+- **Docker 镜像**：[`midaug/docker-mirror-gateway`](https://hub.docker.com/r/midaug/docker-mirror-gateway)，支持 `linux/amd64`、`linux/arm64`、`linux/arm/v7`、`linux/386`；标签与 [Releases](https://github.com/midaug/docker-mirror-gateway/releases) 版本一致，另有 `latest`
+
+```bash
+docker pull midaug/docker-mirror-gateway:latest
+
+cp config.example.yaml config.yaml   # 先准备配置，再挂载进容器
+
+docker run -d --name docker-mirror-gateway \
+  -p 8080:8080 -p 127.0.0.1:8081:8081 \
+  -v docker-mirror-gateway:/var/lib/docker-mirror-gateway \
+  -v ./config.yaml:/etc/docker-mirror-gateway/config.yaml:ro \
+  midaug/docker-mirror-gateway:latest
+```
+
+### Docker Compose
 
 ```bash
 cp config.example.yaml config.yaml   # 从示例配置开始，按需修改 groups 与镜像源
@@ -109,17 +128,6 @@ make vet      # go vet ./...
 make fmt      # gofmt
 make build    # 产出 bin/docker-mirror-gateway
 make up       # docker compose up -d --build
-```
-
-### 版本发布
-
-打 tag 推送即自动触发两个 GitHub Actions：
-
-- **Release**：交叉编译 Linux（amd64/arm64/armv7/386）、macOS（amd64/arm64）、Windows（amd64/arm64/386）二进制并发布到 GitHub Releases，Release Note 按 feat/fix 自动分类
-- **Docker**：构建 `linux/amd64`、`linux/arm64`、`linux/arm/v7`、`linux/386` 多架构镜像推送到 [Docker Hub](https://hub.docker.com/r/midaug/docker-mirror-gateway)，标签为 `<版本>`/`<主.次>`/`latest`（需在仓库 Secrets 配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN`）
-
-```bash
-git tag v0.1.0 && git push origin v0.1.0
 ```
 
 ## 说明
