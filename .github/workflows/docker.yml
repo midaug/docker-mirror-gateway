@@ -1,0 +1,89 @@
+name: Docker
+
+# 打 tag（如 v1.0.0）时构建多架构容器镜像并发布到 Docker Hub：
+#   midaug/docker-mirror-gateway:1.2.3 / 1.2 / latest
+# 支持 linux/amd64、linux/arm64、linux/arm/v7、linux/386。
+# 在 Actions 页面手动触发时只构建 amd64 验证 Dockerfile 可用，不推送。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: midaug/docker-mirror-gateway
+
+jobs:
+  build-and-push:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # QEMU 提供 arm64 / armv7 / 386 的跨架构运行能力（Go 交叉编译其实不需要
+      # 模拟器，但 386 目标镜像的 alpine 基础层拉取需要它）
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64,arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 登录 Docker Hub。需要在仓库 Settings → Secrets and variables → Actions
+      # 配置 DOCKERHUB_USERNAME 与 DOCKERHUB_TOKEN（Docker Hub → Account
+      # Settings → Security → New Access Token，权限选 Read & Write）。
+      - name: Login to Docker Hub
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 版本 tag：1.2.3 / 1.2 / 1 / latest（v 前缀自动去除）；手动触发：dev
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=dev,enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # tag 触发构建全架构并推送；手动触发只构建 amd64 做验证
+          platforms: ${{ startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64,linux/arm/v7,linux/386' || 'linux/amd64' }}
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false # 避免推送带 unknown/unknown 架构的 attest 清单
+
+      # 手动触发时拉起来冒烟验证：健康检查能过才算构建成功
+      - name: Smoke test (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          docker run -d --name smoke -p 8080:8080 ${{ env.IMAGE }}:dev
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/healthz > /dev/null; then
+              echo "✅ 健康检查通过"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::冒烟测试失败：容器健康检查未通过"
+          docker logs smoke
+          exit 1

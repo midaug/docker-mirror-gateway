@@ -111,6 +111,17 @@ make build    # 产出 bin/docker-mirror-gateway
 make up       # docker compose up -d --build
 ```
 
+### 版本发布
+
+打 tag 推送即自动触发两个 GitHub Actions：
+
+- **Release**：交叉编译 Linux（amd64/arm64/armv7/386）、macOS（amd64/arm64）、Windows（amd64/arm64/386）二进制并发布到 GitHub Releases，Release Note 按 feat/fix 自动分类
+- **Docker**：构建 `linux/amd64`、`linux/arm64`、`linux/arm/v7`、`linux/386` 多架构镜像推送到 [Docker Hub](https://hub.docker.com/r/midaug/docker-mirror-gateway)，标签为 `<版本>`/`<主.次>`/`latest`（需在仓库 Secrets 配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN`）
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
 ## 说明
 
 `config.example.yaml` 中的公共镜像源仅作示例，请替换为你有权使用、且服务条款允许的源；生产环境请自建或使用官方源，并遵守对应仓库的速率与使用政策。

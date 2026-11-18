@@ -1,0 +1,211 @@
+name: Release
+
+# 打 tag（如 v1.0.0）时自动交叉编译全平台二进制并发布 Release；
+# 也支持在 Actions 页面手动触发用于测试（仅构建产物，不发 Release）。
+#
+# 本项目是纯 Go、CGO_ENABLED=0 的服务端程序，无系统库依赖，
+# 全部目标都在 ubuntu-latest 上交叉编译，无需各平台 runner。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # softprops/action-gh-release 需要写权限来创建 Release
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # 单个目标失败不影响其它目标继续构建
+      matrix:
+        include:
+          # ---- Linux：服务端主战场，amd64 / arm64（树莓派 4/64 位 NAS）/ armv7（树莓派 32 位）/ 386 ----
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+          - goos: linux
+            goarch: '386'
+          # ---- macOS：Intel + Apple Silicon ----
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          # ---- Windows：amd64 / arm64 / 386 ----
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+          - goos: windows
+            goarch: '386'
+            ext: .exe
+    env:
+      APP: docker-mirror-gateway
+      ARTIFACT: docker-mirror-gateway-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && 'v' || '' }}${{ matrix.goarm }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23'
+          cache: true
+
+      # tag 触发用 tag 名作为版本号，手动触发回退为 dev
+      - name: Set version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 交叉编译。-X main.version 注入版本号，`-version` 参数与控制台都会显示。
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -o "dist/${APP}${{ matrix.ext }}" ./cmd/docker-mirror-gateway
+
+      # 打包：二进制 + LICENSE + README 放压缩包根目录（不带 ../ 前缀，
+      # 否则 GNU tar 解包时会因 ".." 成员拒绝提取）；
+      # Linux & macOS 用 tar.gz，Windows 用 zip。
+      - name: Package
+        run: |
+          cd dist
+          mkdir -p pkg
+          cp "${APP}${{ matrix.ext }}" pkg/
+          cp ../LICENSE ../README.md pkg/
+          cd pkg
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "../${ARTIFACT}.zip" LICENSE README.md "${APP}${{ matrix.ext }}"
+          else
+            tar czf "../${ARTIFACT}.tar.gz" LICENSE README.md "${APP}${{ matrix.ext }}"
+          fi
+          cd ..
+          rm -rf pkg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: dist/${{ env.ARTIFACT }}.*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout (full history, for changelog)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # 基于“上一个 tag → 当前 tag”之间的 commit 生成中文 Release Note，
+      # 按 feat / fix / 其它 分类，直观体现本次相对上次的变化。
+      - name: Generate changelog
+        id: changelog
+        run: |
+          set -euo pipefail
+          CUR_TAG="${GITHUB_REF_NAME}"
+          # 取上一个 tag（按创建时间倒序，跳过当前 tag）
+          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${CUR_TAG}$" | head -1 || true)
+
+          RANGE="${PREV_TAG:+$PREV_TAG..HEAD}"
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          fi
+
+          echo "范围: ${RANGE:-所有提交}"
+
+          # 分类提取 commit（去重 subject，去掉 trivial merge）
+          feats=$(git log ${RANGE} --pretty=format:'%s' 2>/dev/null | grep -iE '^feat' | sed 's/^[^:]*: *//' | sort -u || true)
+          fixes=$(git log ${RANGE} --pretty=format:'%s' 2>/dev/null | grep -iE '^fix' | sed 's/^[^:]*: *//' | sort -u || true)
+          others=$(git log ${RANGE} --pretty=format:'%s' 2>/dev/null | grep -ivE '^(feat|fix|merge|chore|ci|docs|style|refactor|test|perf)(\(|:)' | sort -u || true)
+
+          {
+            echo "body<<EOF"
+            echo "## 📦 下载"
+            echo
+            echo "| 平台 | 架构 | 文件 |"
+            echo "| --- | --- | --- |"
+            echo "| Linux | x64 | \`docker-mirror-gateway-${CUR_TAG}-linux-amd64.tar.gz\` |"
+            echo "| Linux | arm64 | \`docker-mirror-gateway-${CUR_TAG}-linux-arm64.tar.gz\` |"
+            echo "| Linux | armv7 | \`docker-mirror-gateway-${CUR_TAG}-linux-armv7.tar.gz\` |"
+            echo "| Linux | x86 | \`docker-mirror-gateway-${CUR_TAG}-linux-386.tar.gz\` |"
+            echo "| macOS | Intel | \`docker-mirror-gateway-${CUR_TAG}-darwin-amd64.tar.gz\` |"
+            echo "| macOS | Apple Silicon | \`docker-mirror-gateway-${CUR_TAG}-darwin-arm64.tar.gz\` |"
+            echo "| Windows | x64 | \`docker-mirror-gateway-${CUR_TAG}-windows-amd64.zip\` |"
+            echo "| Windows | ARM64 | \`docker-mirror-gateway-${CUR_TAG}-windows-arm64.zip\` |"
+            echo "| Windows | x86 | \`docker-mirror-gateway-${CUR_TAG}-windows-386.zip\` |"
+            echo
+            echo "> 服务端部署推荐 Linux amd64/arm64；桌面平台产物主要用于本地调试管理命令。容器镜像见 [Docker Hub](https://hub.docker.com/r/midaug/docker-mirror-gateway)。"
+            echo
+
+            if [ -n "$PREV_TAG" ]; then
+              # 有上个版本：输出相对上次的变更日志
+              echo "## 📝 变更日志"
+              echo
+              echo "相对 [\`${PREV_TAG}\`](../../releases/tag/${PREV_TAG}) 的变化："
+              echo
+
+              if [ -n "$feats" ]; then
+                echo "### ✨ 新功能"
+                echo "$feats" | sed 's/^/- /'
+                echo
+              fi
+              if [ -n "$fixes" ]; then
+                echo "### 🐛 问题修复"
+                echo "$fixes" | sed 's/^/- /'
+                echo
+              fi
+              if [ -n "$others" ]; then
+                echo "### 📌 其它"
+                echo "$others" | sed 's/^/- /'
+                echo
+              fi
+              if [ -z "$feats" ] && [ -z "$fixes" ] && [ -z "$others" ]; then
+                echo "_(无显著变更记录)_"
+                echo
+              fi
+              echo "---"
+              echo "> 完整提交历史见 [commits 比较](../../compare/${PREV_TAG}...${CUR_TAG})"
+            else
+              # 首次发布：无上个版本，不输出变更对比
+              echo "## 🎉 首次发布"
+              echo
+              echo "这是 docker-mirror-gateway 的第一个正式版本。"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          generate-release-notes: true # 追加 GitHub 自动生成的 notes 作为补充
+          files: |
+            artifacts/*
