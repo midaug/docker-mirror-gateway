@@ -114,3 +114,8 @@ make up       # docker compose up -d --build
 ## 说明
 
 `config.example.yaml` 中的公共镜像源仅作示例，请替换为你有权使用、且服务条款允许的源；生产环境请自建或使用官方源，并遵守对应仓库的速率与使用政策。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 midaug
+
