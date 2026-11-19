@@ -216,11 +216,9 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 		authChallenge string // 第一个返回 401 挑战的上游原始挑战头
 		challengeFrom string
 	)
-	clientAuth := ""
-	passthrough := p.router.PassthroughFor(route.Group)
-	if passthrough {
-		clientAuth = r.Header.Get("Authorization")
-	}
+	// 客户端原始 Authorization 只是候选凭证：每个上游按自己的 auth 配置
+	// 决定是否使用，config 源永远不会收到客户端凭证。
+	clientAuth := r.Header.Get("Authorization")
 	cands, prefetched := route.Group.Pool.CandidatesForManifest(ctx, name, ref, accept)
 	for _, u := range cands {
 		if ctx.Err() != nil {
@@ -235,7 +233,9 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 			act.SetCache("miss")
 			act.SetBytes(int64(len(m.Body)))
 			act.Finish()
-			p.storeManifest(route.Group.Name, name, ref, class, mutable, m)
+			if !u.Passthrough() {
+				p.storeManifest(route.Group.Name, name, ref, class, mutable, m)
+			}
 			p.serveManifest(w, r, m, "miss", u.Name, route.Group.Name)
 			return
 		}
@@ -244,8 +244,8 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 		m, ch, err := p.fetchManifest(ctx, u, name, ref, accept, mutable, clientAuth)
 		p.log.Debug("manifest 拉取尝试", "upstream", u.Name, "ref", ref,
 			"elapsed", time.Since(start).Round(time.Millisecond).String(), "err", err)
-		if ch != "" && passthrough {
-			// 透传模式下上游要求认证（客户端凭证无效/过期，或匿名被拒）：
+		if ch != "" && u.Passthrough() {
+			// 该源要求客户端凭证（未登录、凭证无效/过期，或匿名被拒）：
 			// 记下挑战继续尝试其他源，链尾把它改写后转给客户端。
 			if authChallenge == "" {
 				authChallenge, challengeFrom = ch, u.Name
@@ -259,7 +259,8 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 			act.SetCache("miss")
 			act.SetBytes(int64(len(m.Body)))
 			act.Finish()
-			if clientAuth == "" {
+			if !u.Passthrough() {
+				// 透传源的流量不写共享缓存：客户端身份换取的内容可能是私有镜像。
 				p.storeManifest(route.Group.Name, name, ref, class, mutable, m)
 			}
 			p.serveManifest(w, r, m, "miss", u.Name, route.Group.Name)
@@ -299,10 +300,10 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 		p.log.Warn("从上游获取 manifest 失败", "group", route.Group.Name, "upstream", u.Name, "repo", name, "ref", ref, "error", err)
 	}
 
-	// 透传模式：循环中有上游返回 401 认证挑战（私有仓库、匿名配额用尽），
+	// 有 auth=passthrough 的上游返回 401 认证挑战（私有仓库、匿名配额用尽），
 	// 把挑战改写后转给客户端——docker 会用登录凭证（或匿名）到网关的
-	// /token 端点换取上游令牌，再带着令牌重试。
-	if passthrough && authChallenge != "" {
+	// /token 端点换取该上游的令牌，再带着令牌重试。
+	if authChallenge != "" {
 		act.Fail(errors.New("上游要求认证"))
 		w.Header().Set("WWW-Authenticate", rewriteChallenge(authChallenge, challengeFrom, p.router.PublicOrigin(r)))
 		writeRegistryError(w, http.StatusUnauthorized, "UNAUTHORIZED", "该仓库需要认证：请先 docker login 本站点，或检查登录凭证", nil)
@@ -519,11 +520,7 @@ func (p *Proxy) headBlob(w http.ResponseWriter, r *http.Request, route *Route, d
 		authChallenge string
 		challengeFrom string
 	)
-	passthrough := p.router.PassthroughFor(route.Group)
-	clientAuth := ""
-	if passthrough {
-		clientAuth = r.Header.Get("Authorization")
-	}
+	clientAuth := r.Header.Get("Authorization")
 	for _, u := range route.Group.Pool.Candidates() {
 		if ctx.Err() != nil {
 			return
@@ -531,7 +528,7 @@ func (p *Proxy) headBlob(w http.ResponseWriter, r *http.Request, route *Route, d
 		attempted++
 		start := time.Now()
 		resp, ch, err := u.DoAuth(ctx, http.MethodHead, blobPath(name, digest), nil, "repository:"+name+":pull", clientAuth)
-		if ch != "" && passthrough {
+		if ch != "" && u.Passthrough() {
 			if authChallenge == "" {
 				authChallenge, challengeFrom = ch, u.Name
 			}
@@ -593,7 +590,7 @@ func (p *Proxy) headBlob(w http.ResponseWriter, r *http.Request, route *Route, d
 		}
 	}
 
-	if passthrough && authChallenge != "" {
+	if authChallenge != "" {
 		// HEAD 响应不带 body，但 WWW-Authenticate 头足以触发 docker 换令牌。
 		w.Header().Set("WWW-Authenticate", rewriteChallenge(authChallenge, challengeFrom, p.router.PublicOrigin(r)))
 		w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
@@ -626,11 +623,7 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 		authChallenge string
 		challengeFrom string
 	)
-	passthrough := p.router.PassthroughFor(route.Group)
-	clientAuth := ""
-	if passthrough {
-		clientAuth = r.Header.Get("Authorization")
-	}
+	clientAuth := r.Header.Get("Authorization")
 
 	for _, u := range route.Group.Pool.Candidates() {
 		if ctx.Err() != nil {
@@ -644,7 +637,7 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 		}
 
 		resp, ch, err := u.DoAuth(ctx, http.MethodGet, blobPath(name, digest), header, "repository:"+name+":pull", clientAuth)
-		if ch != "" && passthrough {
+		if ch != "" && u.Passthrough() {
 			// 上游要求认证：记下挑战换源，链尾改写后转给客户端。
 			if authChallenge == "" {
 				authChallenge, challengeFrom = ch, u.Name
@@ -725,8 +718,8 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 		p.writeBlobHeaders(w, resp, digest, route.Group.Name, u.Name, "miss")
 
 		var writer cache.Writer
-		if clientAuth == "" && rangeHeader == "" && resp.StatusCode == http.StatusOK && p.cache.Backend() != "none" {
-			// 带客户端凭证的流量不写缓存：令牌属于客户端身份，其拉取的
+		if !u.Passthrough() && rangeHeader == "" && resp.StatusCode == http.StatusOK && p.cache.Backend() != "none" {
+			// 透传源的流量不写共享缓存：令牌属于客户端身份，其拉取的
 			// 内容（可能是私有镜像）不应进入匿名共享缓存。
 			writer, err = p.cache.NewBlobWriter(digest)
 			if err != nil {
@@ -773,7 +766,7 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 		return
 	}
 
-	if passthrough && authChallenge != "" {
+	if authChallenge != "" {
 		act.Fail(errors.New("上游要求认证"))
 		w.Header().Set("WWW-Authenticate", rewriteChallenge(authChallenge, challengeFrom, p.router.PublicOrigin(r)))
 		writeRegistryError(w, http.StatusUnauthorized, "UNAUTHORIZED", "该镜像层需要认证：请先 docker login 本站点，或检查登录凭证", nil)
@@ -859,23 +852,11 @@ func (p *Proxy) ServeToken(w http.ResponseWriter, r *http.Request) {
 	upstreamName := r.URL.Query().Get("upstream")
 	scope := r.URL.Query().Get("scope")
 
-	// 只允许为「开启了透传的分组」内的上游换取令牌。
-	var u *Upstream
-	for _, g := range p.router.Groups() {
-		if !p.router.PassthroughFor(g) {
-			continue
-		}
-		for _, cand := range g.Pool.Upstreams() {
-			if cand.Name == upstreamName {
-				u = cand
-				break
-			}
-		}
-		if u != nil {
-			break
-		}
-	}
-	if u == nil {
+	// 只允许为该源自身配置 auth=passthrough 的上游换取令牌。
+	// 不再按分组或 Host 推断：认证方式完全由源配置决定，
+	// 多域名部署的安全责任由部署者承担（见配置文档）。
+	u, _ := p.router.ByName(upstreamName)
+	if u == nil || !u.Passthrough() {
 		writeRegistryError(w, http.StatusNotFound, "UNSUPPORTED", "无效的令牌服务目标", map[string]string{"upstream": upstreamName})
 		return
 	}
@@ -924,15 +905,12 @@ func (p *Proxy) ServeTags(w http.ResponseWriter, r *http.Request, name string) {
 	var (
 		lastErr       error
 		notFound      int
+		denied        int
 		attempted     int
 		authChallenge string
 		challengeFrom string
 	)
-	passthrough := p.router.PassthroughFor(route.Group)
-	clientAuth := ""
-	if passthrough {
-		clientAuth = r.Header.Get("Authorization")
-	}
+	clientAuth := r.Header.Get("Authorization")
 	for _, u := range route.Group.Pool.Candidates() {
 		if ctx.Err() != nil {
 			return
@@ -940,7 +918,7 @@ func (p *Proxy) ServeTags(w http.ResponseWriter, r *http.Request, name string) {
 		attempted++
 		start := time.Now()
 		resp, ch, err := u.DoAuth(ctx, http.MethodGet, path, nil, "repository:"+name+":pull", clientAuth)
-		if ch != "" && passthrough {
+		if ch != "" && u.Passthrough() {
 			if authChallenge == "" {
 				authChallenge, challengeFrom = ch, u.Name
 			}
@@ -951,6 +929,11 @@ func (p *Proxy) ServeTags(w http.ResponseWriter, r *http.Request, name string) {
 				return // 客户端已断开，这不是上游的错，不计失败
 			}
 			lastErr = err
+			if errors.Is(err, ErrUnauthorized) {
+				// 上游令牌接口拒绝或 401 无挑战：仓库级策略，不降级源。
+				denied++
+				continue
+			}
 			u.ReportFailure(err)
 			continue
 		}
@@ -968,6 +951,12 @@ func (p *Proxy) ServeTags(w http.ResponseWriter, r *http.Request, name string) {
 				// 源把 404 NAME_UNKNOWN/MANIFEST_UNKNOWN 包装成 500，按不存在处理。
 				notFound++
 				u.ReportSuccess(time.Since(start))
+				continue
+			}
+			if resp.StatusCode == http.StatusUnauthorized || (resp.StatusCode == http.StatusForbidden && isDenylistBody(body)) {
+				// 仓库级策略拒绝，不是源故障。
+				denied++
+				lastErr = fmt.Errorf("%s 拒绝访问(%d): %s", u.Name, resp.StatusCode, snippet(body))
 				continue
 			}
 			lastErr = fmt.Errorf("%s 返回 %d: %s", u.Name, resp.StatusCode, snippet(body))
@@ -1005,19 +994,26 @@ func (p *Proxy) ServeTags(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 
-	if passthrough && authChallenge != "" {
+	if authChallenge != "" {
 		w.Header().Set("WWW-Authenticate", rewriteChallenge(authChallenge, challengeFrom, p.router.PublicOrigin(r)))
 		writeRegistryError(w, http.StatusUnauthorized, "UNAUTHORIZED", "该仓库需要认证：请先 docker login 本站点，或检查登录凭证", nil)
 		return
 	}
 
-	if notFound > 0 && notFound == attempted {
-		writeRegistryError(w, http.StatusNotFound, "NAME_UNKNOWN", "仓库不存在", map[string]string{"name": name})
+	if notFound+denied == attempted {
+		msg := "仓库不存在"
+		if denied > 0 {
+			msg = "各镜像源均未提供此仓库（部分源要求认证或受白名单限制）"
+		}
+		writeRegistryError(w, http.StatusNotFound, "NAME_UNKNOWN", msg, map[string]string{"name": name})
 		return
 	}
 	msg := "所有上游镜像源均不可用"
 	if lastErr != nil {
 		msg = lastErr.Error()
+	}
+	if missing := notFound + denied; missing > 0 {
+		msg = fmt.Sprintf("%s（另有 %d 个镜像源未收录此仓库）", msg, missing)
 	}
 	writeRegistryError(w, http.StatusBadGateway, "UNKNOWN", msg, nil)
 }

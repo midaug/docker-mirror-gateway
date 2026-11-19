@@ -865,17 +865,16 @@ func (f *fakeRegistry) handleAlwaysChallenge(w http.ResponseWriter, name string)
 	return true
 }
 
-// newPassthroughProxy 构造开启认证透传、分组绑定域名的测试代理。
-func newPassthroughProxy(t *testing.T, upstreams []config.UpstreamConfig, hosts []string, c *cache.Cache) (*Proxy, *Router) {
+// newAuthTestProxy 构造认证测试用代理。认证方式完全由每个 upstream 的
+// Auth 字段决定；这里不再设置全局开关，也不要求分组绑定 hosts。
+func newAuthTestProxy(t *testing.T, upstreams []config.UpstreamConfig, c *cache.Cache) (*Proxy, *Router) {
 	t.Helper()
 	log := testLogger()
 	m := metrics.New()
 	cfg := config.Default()
-	cfg.Auth.Passthrough = true
 	cfg.Groups = []config.GroupConfig{{
 		Name:             "test",
 		Priority:         10,
-		Hosts:            hosts,
 		Default:          true,
 		LibraryNamespace: "library",
 		Upstreams:        upstreams,
@@ -883,6 +882,7 @@ func newPassthroughProxy(t *testing.T, upstreams []config.UpstreamConfig, hosts 
 	cfg.Routing.AutoDetect = false
 	cfg.Routing.DefaultGroup = "test"
 	cfg.Health.Timeout = config.Duration(2 * time.Second)
+	cfg.Selection.PreferFresh = false // 避免 latest 的新旧预取绕过主拉取链路
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -900,8 +900,9 @@ func TestProxyPassthroughChallengeRelayed(t *testing.T) {
 	f.alwaysChallenge = true
 
 	c := newTestCache(t)
-	p, _ := newPassthroughProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}},
-		[]string{"docker.example.com"}, c)
+	p, _ := newAuthTestProxy(t, []config.UpstreamConfig{{
+		Name: "fake", URL: f.URL, Priority: 10, Auth: config.UpstreamAuthPassthrough,
+	}}, c)
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/library/private/manifests/latest", nil)
 	req.Host = "docker.example.com"
@@ -935,8 +936,9 @@ func TestProxyPassthroughClientAuthForwarded(t *testing.T) {
 		[]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{}}`))
 
 	c := newTestCache(t)
-	p, _ := newPassthroughProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}},
-		[]string{"quay.example.com"}, c)
+	p, _ := newAuthTestProxy(t, []config.UpstreamConfig{{
+		Name: "fake", URL: f.URL, Priority: 10, Auth: config.UpstreamAuthPassthrough,
+	}}, c)
 
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil)
@@ -960,34 +962,19 @@ func TestProxyPassthroughClientAuthForwarded(t *testing.T) {
 	}
 }
 
-// 令牌换取端点：凭证只发给目标上游自己的令牌服务；未开启透传的分组、
-// 不存在的上游一律 404（防把端点当跳板）。
+// 令牌换取端点：凭证只发给 auth=passthrough 上游自己的令牌服务；
+// 同组里 auth=config 的源和不存在的上游一律 404（防把端点当跳板）。
 func TestProxyPassthroughTokenEndpoint(t *testing.T) {
 	f := newFakeRegistry(t)
 	f.token = "upstream-token-xyz"
 	f.tokenUser, f.tokenPass = "alice", "s3cret"
+	configSource := newFakeRegistry(t)
 
 	c := newTestCache(t)
-	p, router := newPassthroughProxy(t, []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}},
-		[]string{"docker.example.com"}, c)
-	// 对照组：未开透传的分组（无 hosts）也挂了一个 fake 名字的上游
-	noAuth := newFakeRegistry(t)
-	cfg2 := config.Default()
-	cfg2.Groups = []config.GroupConfig{{
-		Name: "plain", Priority: 20, Default: false,
-		Upstreams: []config.UpstreamConfig{{Name: "fake", URL: noAuth.URL, Priority: 10}},
-	}}
-	cfg2.Routing.AutoDetect = false
-	cfg2.Routing.DefaultGroup = "plain"
-	cfg2.Health.Timeout = config.Duration(2 * time.Second)
-	if err := cfg2.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	r2, err := NewRouter(cfg2, testLogger(), metrics.New())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = r2
+	p, _ := newAuthTestProxy(t, []config.UpstreamConfig{
+		{Name: "fake", URL: f.URL, Priority: 10, Auth: config.UpstreamAuthPassthrough},
+		{Name: "plain", URL: configSource.URL, Priority: 20}, // 默认 config
+	}, c)
 
 	tokenReq := func(upstream, user, pass string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/token?upstream="+upstream+"&service=fake-registry&scope=repository:library/private:pull", nil)
@@ -1019,41 +1006,33 @@ func TestProxyPassthroughTokenEndpoint(t *testing.T) {
 		t.Errorf("错误凭证状态码 = %d, 期望 401", rec.Code)
 	}
 
-	// 不存在的上游 → 404（防止端点被当作向任意目标转发凭证的跳板）
+	// auth=config 的同组上游不能作为凭证转发目标
+	rec = tokenReq("plain", "alice", "s3cret")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("config 源状态码 = %d, 期望 404", rec.Code)
+	}
+	// 不存在的上游 → 404
 	rec = tokenReq("nonexistent", "alice", "s3cret")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("不存在上游状态码 = %d, 期望 404", rec.Code)
 	}
-	_ = router
 }
 
-// 全局开关开着但分组没配 hosts（单域名多分组）：凭证不得透传——
-// 否则登录 Docker Hub 的密码会被带给 ghcr/quay 等其他组的上游。
-func TestProxyPassthroughRequiresHosts(t *testing.T) {
-	f := newFakeRegistry(t)
-	f.addManifest("library/nginx", "latest", MediaTypeDockerManifest,
+// 认证方式按源隔离，与分组是否配置 hosts 无关：未登录凭证只发给
+// auth=passthrough 的源；auth=config 的源永远只用自己配置的账号。
+func TestProxyAuthModeIsPerUpstream(t *testing.T) {
+	pass := newFakeRegistry(t)
+	pass.token = "" // 接受任意 Authorization，便于观察客户端凭证是否到达
+	cfgSource := newFakeRegistry(t)
+	cfgSource.token = "config-token"
+	cfgSource.addManifest("library/nginx", "latest", MediaTypeDockerManifest,
 		[]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{}}`))
 
 	c := newTestCache(t)
-	log := testLogger()
-	m := metrics.New()
-	cfg := config.Default()
-	cfg.Auth.Passthrough = true // 全局开启
-	cfg.Groups = []config.GroupConfig{{
-		Name: "test", Priority: 10, Default: true, // 无 hosts
-		Upstreams: []config.UpstreamConfig{{Name: "fake", URL: f.URL, Priority: 10}},
-	}}
-	cfg.Routing.AutoDetect = false
-	cfg.Routing.DefaultGroup = "test"
-	cfg.Health.Timeout = config.Duration(2 * time.Second)
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	router, err := NewRouter(cfg, log, m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := NewProxy(router, c, Options{MaxManifestBytes: 1 << 20}, log, m)
+	p, _ := newAuthTestProxy(t, []config.UpstreamConfig{
+		{Name: "pass", URL: pass.URL, Priority: 10, Auth: config.UpstreamAuthPassthrough},
+		{Name: "cfg", URL: cfgSource.URL, Priority: 20, Username: "cfg-user", Password: "cfg-pass"},
+	}, c)
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil)
 	req.SetBasicAuth("docker-login-user", "docker-login-password")
@@ -1063,8 +1042,14 @@ func TestProxyPassthroughRequiresHosts(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("状态码 = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	got, _ := f.lastAuth.Load().(string)
-	if got != "Bearer "+f.token {
-		t.Errorf("未配 hosts 的分组不应透传凭证, 上游收到 %q", got)
+	// 透传源（即使没有 hosts）收到客户端 Basic 原文
+	got, _ := pass.lastAuth.Load().(string)
+	if got != "Basic "+base64.StdEncoding.EncodeToString([]byte("docker-login-user:docker-login-password")) {
+		t.Errorf("透传源收到的 Authorization = %q, 期望客户端 Basic 原文", got)
+	}
+	// 配置源收到的是用自己账号换的 Bearer token
+	got, _ = cfgSource.lastAuth.Load().(string)
+	if got != "Bearer config-token" {
+		t.Errorf("config 源收到的 Authorization = %q, 期望配置账号换的 token", got)
 	}
 }

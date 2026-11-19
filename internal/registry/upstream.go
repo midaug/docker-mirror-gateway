@@ -41,6 +41,7 @@ type Upstream struct {
 
 	username    string
 	password    string
+	passthrough bool
 	headers     map[string]string
 	proxy       string
 	client      *http.Client
@@ -142,6 +143,7 @@ func NewUpstream(cfg config.UpstreamConfig, group string, failThreshold int, log
 		Priority:      cfg.Priority,
 		username:      cfg.Username,
 		password:      cfg.Password,
+		passthrough:   cfg.Passthrough(),
 		headers:       cfg.Headers,
 		proxy:         proxyLabel,
 		client:        &http.Client{Transport: transport},
@@ -188,16 +190,21 @@ func (u *Upstream) Do(ctx context.Context, method, path string, header http.Head
 	return resp, nil
 }
 
-// DoAuth 在 Do 的基础上支持客户端凭证透传，供认证透传模式使用：
+// Passthrough 报告该源的认证方式是否为客户端凭证透传。
+func (u *Upstream) Passthrough() bool { return u.passthrough }
+
+// DoAuth 在 Do 的基础上支持按源认证透传。
 //
-//   - clientAuth 非空：直接作为 Authorization 头发给上游（不查网关令牌缓存、
-//     不用配置账号）；上游返回 401 且带挑战时不自动重试，而是返回 challenge
-//     由上层改写后透传给客户端（docker 会自己去换令牌）。
-//   - clientAuth 为空：与 Do 相同的网关代管认证；自动换取失败时把上游原始
-//     挑战放在 challenge 里带回，透传模式下上层可转给客户端。
+// clientAuth 是客户端原始 Authorization 头（可能为空），仅当该源配置
+// auth=passthrough 时才使用；否则忽略它，按本源配置的账号自动认证。
 //
-// challenge 仅在上游返回 401 且响应携带 WWW-Authenticate 时非空（此时 resp
-// 为 nil、body 已关闭）。非透传调用方应忽略 challenge 并按 err/resp 处理。
+//   - auth=passthrough：客户端凭证原样发给上游，不查网关令牌缓存、不用
+//     配置账号；上游返回 401 且带挑战时返回 (nil, challenge, nil)，由上层
+//     改写 realm 后交给客户端（docker 自己去 /token 换令牌）。
+//   - auth=config（默认）：使用本源 username/password 自动完成 Bearer/Basic
+//     认证；认证失败返回 err 并把原始挑战放在 challenge 里，不返回给客户端。
+//
+// challenge 非空时 resp 一定为 nil 且 body 已关闭。
 func (u *Upstream) DoAuth(ctx context.Context, method, path string, header http.Header, scope, clientAuth string) (*http.Response, string, error) {
 	u.reqTotal.Add(1)
 	u.mReq.Inc()
@@ -229,8 +236,8 @@ func (u *Upstream) DoAuth(ctx context.Context, method, path string, header http.
 		return ch
 	}
 
-	// 客户端凭证透传：完全以客户端身份访问上游，401 时把挑战交还上层。
-	if clientAuth != "" {
+	// 该源配置为透传：即使客户端未登录也走匿名请求，绝不回退到配置账号。
+	if u.passthrough {
 		resp, err := attempt(clientAuth)
 		if err != nil {
 			return nil, "", err
@@ -270,31 +277,41 @@ func (u *Upstream) DoAuth(ctx context.Context, method, path string, header http.
 		newToken, ttl, err := u.fetchToken(ctx, ch, scope)
 		u.log.Debug("换取上游令牌", "elapsed", time.Since(tokenStart).Round(time.Millisecond).String(), "err", err)
 		if err != nil {
-			// 换取失败时把上游原始挑战带回：透传模式下可转给客户端，
-			// 让它自己完成认证（私有仓库、配额场景）。
+			// 配置账号换取失败：这是仓库级认证失败，交给上层按 denied 处理。
 			return nil, rawChallenge, err
 		}
 		u.tokens.put(scope, newToken, ttl)
 		resp, err := attempt("Bearer " + newToken)
-		if err == nil && resp.StatusCode == http.StatusUnauthorized {
-			ch := readChallenge(resp)
-			if ch != "" {
-				return nil, ch, nil
-			}
+		if err != nil {
+			return nil, "", err
 		}
-		return resp, "", err
+		if resp.StatusCode == http.StatusUnauthorized {
+			ch2 := readChallenge(resp)
+			if ch2 == "" {
+				ch2 = rawChallenge
+			}
+			// 刚换的令牌被上游拒绝：清掉缓存，避免同 scope 的后续请求
+			// 每次都先用坏令牌撞一次 401 再重新换取。
+			u.tokens.invalidate(scope)
+			return nil, ch2, fmt.Errorf("%w: %s 拒绝了配置账号换取的令牌", ErrUnauthorized, u.Name)
+		}
+		return resp, "", nil
 	case "basic":
 		if u.username == "" {
 			return nil, rawChallenge, fmt.Errorf("%w: %s 需要 Basic 认证，但未配置账号", ErrUnauthorized, u.Name)
 		}
 		resp, err := attempt("Basic " + base64.StdEncoding.EncodeToString([]byte(u.username+":"+u.password)))
-		if err == nil && resp.StatusCode == http.StatusUnauthorized {
-			ch := readChallenge(resp)
-			if ch != "" {
-				return nil, ch, nil
-			}
+		if err != nil {
+			return nil, "", err
 		}
-		return resp, "", err
+		if resp.StatusCode == http.StatusUnauthorized {
+			ch2 := readChallenge(resp)
+			if ch2 == "" {
+				ch2 = rawChallenge
+			}
+			return nil, ch2, fmt.Errorf("%w: %s 拒绝了配置账号", ErrUnauthorized, u.Name)
+		}
+		return resp, "", nil
 	default:
 		return nil, rawChallenge, fmt.Errorf("%w: %s 返回 401 且未提供可用的认证挑战", ErrUnauthorized, u.Name)
 	}

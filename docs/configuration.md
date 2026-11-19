@@ -80,36 +80,53 @@
 | `access.trustForwardedFor` | `false` | 是否采信 `X-Forwarded-For` |
 | `search.enabled` | `true` | 控制台镜像搜索 |
 
-## auth（认证透传，公网部署可选）
-
-| 字段 | 默认值 | 说明 |
-| --- | --- | --- |
-| `auth.passthrough` | `false` | 开启后客户端 `docker login` 的凭证会转发给上游（私有镜像、提升匿名拉取配额）。**只对配置了 `hosts`（多域名模式）的分组生效**——单域名按路径区分分组时凭证会被发给错误的组，因此多域名是透传的前提 |
-| `auth.publicURL` | 空 | 改写后的令牌服务对外基准地址（如 `https://docker.example.com`）；留空按请求的 Host 与 `X-Forwarded-Proto` 推导，多域名部署推荐留空 |
-
-工作方式：上游对客户端凭证返回 401 挑战时，网关把挑战的 `realm` 改写指向自己的 `/token` 端点（`service`/`scope` 保留上游原值）转给客户端；docker 用登录凭证到网关 `/token` 换取**上游签发**的令牌后重试，网关把令牌原样转发给该上游。凭证与令牌只会发给对应分组的上游，不会发给第三方；带凭证的拉取不写共享缓存（私有内容不落盘）。
-
-```yaml
-auth:
-  passthrough: true
-  # publicURL: https://docker.example.com   # 网关在反代后拿不到真实 Host 时才需要
-
-groups:
-  - name: dockerhub
-    hosts: [docker.example.com]   # docker login docker.example.com 的凭证只发给本组上游
-    upstreams: [...]
-  - name: ghcr
-    hosts: [ghcr.example.com]     # ghcr.example.com 的凭证只发给本组上游
-    upstreams: [...]
-```
-
-客户端接入：`docker login docker.example.com`（网关不校验凭证、任意账号密码都登录成功，凭证在换上游令牌时才被使用），之后正常 pull；未登录的匿名拉取不受影响。
 | `search.sources` | `[hub, quay, mcr]` | 搜索哪些仓库 |
 | `search.timeout` | `8s` | 单次搜索总超时 |
 | `search.enrichUpdated` | `true` | 是否补查 Quay 的更新时间 |
 | `search.enrichTags` | `true` | 是否补查除 latest 外的最新版本号 |
 
 > `health.probeRepo` / `probeTag` 只对旧版单分组配置（`group:`）生效，多分组请用 `groups[].probeRepo`。
+
+## 上游认证（按源配置）
+
+认证方式属于**每个上游源**，不是全局开关，也不按分组推断。
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `groups[].upstreams[].auth` | `config` | `config`：使用下面 `username`/`password` 自动完成上游认证；`passthrough`：把客户端 `docker login` 的凭证原样用于该源 |
+| `groups[].upstreams[].username` | 空 | 仅 `auth: config` 使用 |
+| `groups[].upstreams[].password` | 空 | 仅 `auth: config` 使用；支持 `${ENV_VAR}` 占位符 |
+
+`auth: passthrough` 与 `username`/`password` 互斥，同时配置会在启动时报错。透传源不使用配置账号，也不复用网关的令牌缓存；客户端凭证只会发给该源自身。透传源的拉取不写共享缓存，避免私有内容进入匿名缓存。
+
+工作方式：透传源返回 401 挑战时，网关把挑战的 `realm` 改写指向自己的 `/token` 端点（`service`/`scope` 保留上游原值）转给客户端；docker 用登录凭证到 `/token` 换取**该上游签发**的令牌后重试。`/token` 只接受配置为 `auth: passthrough` 的上游名，网关会先探测该上游的真实挑战以获得 `realm`/`service`，再把凭证发给它自己的令牌服务，防止被当作任意地址的凭证跳板。挑战 realm 按当前请求的 Host 与 `X-Forwarded-Proto` 推导，反代后请确保传对这两个值。
+
+```yaml
+groups:
+  - name: dockerhub
+    upstreams:
+      # 本地部署推荐：官方源配置自己的账号，不启用透传
+      - name: dockerhub-official
+        url: https://registry-1.docker.io
+        auth: config
+        username: "${DOCKERHUB_USER}"
+        password: "${DOCKERHUB_PASS}"
+
+  - name: ghcr-public
+    hosts: [ghcr.example.com]
+    upstreams:
+      # 公网部署：官方源可以启用透传，让用户用自己的账号拉取
+      - name: ghcr-official
+        url: https://ghcr.io
+        auth: passthrough
+```
+
+### 安全提示
+
+- 本地/内网单域名部署通常**不要**开 `passthrough`，只给需要的源配置 `username`/`password`。
+- `passthrough` 支持配在任意源上，但三方镜像站也会收到用户的 `docker login` 凭证（Basic 原文或换取的 Bearer 令牌）。**除非完全信任该源，否则不要开启**；这不是程序能替你判断的风险。
+- 如果多个分组里的源都启用了 `passthrough`，请按**多域名**部署：每个分组绑定独立域名并让 docker 登录对应域名。程序**不会**校验请求 Host，也不会阻止任意域名传入；凭证是否只到目标分组由部署者负责。单域名靠路径/自动探测区分分组时不要启用多组透传。
+- 客户端接入：`docker login ghcr.example.com`（网关不校验凭证，账号密码在上游令牌服务才被真正使用），之后正常 pull；匿名拉取不受影响。
 
 ## 端口分离
 

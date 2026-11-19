@@ -1,278 +1,135 @@
 # Docker Mirror Gateway 配置文件
-#
-# 所有字段都可以用环境变量覆盖（优先级高于本文件）：
-#   MIRROR_GATEWAY_ADDR            镜像拉取监听地址
-#   MIRROR_GATEWAY_ADMIN_ADDR      管理后台监听地址（留空则与拉取端口合并）
-#   MIRROR_GATEWAY_ADMIN_TOKEN     管理接口令牌
-#   MIRROR_GATEWAY_CACHE_ENABLED   是否启用缓存（true/false）
-#   MIRROR_GATEWAY_CACHE_DIR       缓存目录
-#   MIRROR_GATEWAY_CACHE_MAX_GB    缓存容量（GB）
-#   MIRROR_GATEWAY_TAG_TTL         tag 缓存有效期
-#   MIRROR_GATEWAY_LOG_LEVEL       日志级别
-#   MIRROR_GATEWAY_LOG_FORMAT      日志格式
-# 也支持 ${ENV_VAR} 占位符，便于把账号密码放到环境变量里。
-#
-# 一个实例可以同时服务多个仓库：用 groups 声明分组，每个分组通常对应一个
-# 公共镜像仓库（Docker Hub、GHCR、Quay……），组内可配置多个加速地址。
+# 所有字段都可用环境变量覆盖（如 MIRROR_GATEWAY_ADDR），也支持 ${ENV_VAR} 占位符。
+# 完整字段说明见 docs/configuration.md。
 
 server:
-  # 镜像拉取端口：只暴露 /v2/*，供 Docker / containerd 使用
-  addr: ":8080"
-  # 管理后台独立端口：控制台、/api/*、/metrics 只在这里提供。
-  # 留空表示与 addr 合并；生产环境建议改成独立端口并只绑定内网/回环地址，
-  # 例如 "127.0.0.1:8081"（容器内监听 0.0.0.0，再由端口映射限制来源）。
-  adminAddr: ":8081"
-  # 客户端实际访问镜像服务的地址，用于控制台生成接入示例。
-  # 经过反向代理或使用域名时建议显式配置，例如 "https://mirror.example.com"
-  publicURL: ""
-  # 管理接口（/api/*、/metrics、控制台）的访问令牌。留空表示不校验，建议只在内网监听。
-  adminToken: ""
+  addr: ":8080"                 # 镜像拉取端口（/v2/*）
+  adminAddr: ":8081"            # 管理端口；留空则与 addr 合并，生产建议只绑内网
+  publicURL: ""                 # 对外访问地址，反代/域名时填，如 https://mirror.example.com
+  adminToken: ""                # 管理接口令牌；留空不校验，建议仅内网使用
   readHeaderTimeout: 10s
   idleTimeout: 120s
-  # 单个 manifest 的大小上限（默认 8MB）
-  maxManifestBytes: 8388608
-
-# 认证透传（公网多域名部署可选，本地部署保持默认关闭）。
-# 开启后客户端 docker login 的凭证会转发给上游：可用于拉私有镜像、
-# 用自己的 Docker Hub 账号提升匿名拉取配额。
-# 只对配置了 hosts 的分组生效——单域名按路径区分分组时凭证会被发给
-# 错误的组，因此每个要透传的分组都必须绑定自己的域名。
-# 详细说明见 docs/configuration.md 的 auth 段。
-auth:
-  passthrough: false
-  # 改写后的令牌服务对外基准地址；留空按请求 Host 推导（多域名推荐留空）。
-  # publicURL: "https://docker.example.com"
+  maxManifestBytes: 8388608     # manifest 大小上限（8MB）
 
 cache:
-  # 缓存总开关，默认关闭：所有请求直接回源。
-  # 个人部署往往没有大流量，不占一块磁盘反而更省心；
-  # 想在多台机器间共享缓存或省回源带宽时再打开。
-  enabled: false
-  # 后端类型：disk（本地目录）或 s3（S3 兼容对象存储）
-  backend: disk
-  # 缓存目录，仅 backend=disk 时使用。
-  # 容器内请用 /var/lib/docker-mirror-gateway/cache（compose 已通过环境变量注入）
-  dir: "./data/cache"
-  # 容量上限（GB）。超出后按“最久未访问”淘汰，目标降到 85%。
-  # backend=s3 时填 0 表示不限制。
-  maxSizeGB: 50
-  # tag -> manifest 的缓存有效期；按 digest 的内容不受此限制
-  tagTTL: 5m
-  # 定期执行清理的间隔
-  gcInterval: 10m
-  # manifest 缓存文件的自然过期时间
-  manifestMaxAge: 720h
+  enabled: false                # 默认关闭；多机共享或省回源带宽时再开
+  backend: disk                 # disk 或 s3
+  dir: "./data/cache"           # backend=disk；容器内用 /var/lib/docker-mirror-gateway/cache
+  maxSizeGB: 50                 # 容量上限（GB），按 LRU 淘汰；s3 填 0 不限
+  tagTTL: 5m                    # tag -> manifest 缓存有效期（digest 不受限）
+  gcInterval: 10m               # 清理间隔
+  manifestMaxAge: 720h          # manifest 缓存自然过期时间
 
-  # S3 兼容对象存储，仅 backend=s3 时生效。
-  # 适合多节点共享缓存：MinIO、阿里云 OSS、腾讯云 COS、华为云 OBS 都可以。
-  s3:
-    endpoint: ""            # 只填主机和端口，例如 "minio.example.com:9000"
+  s3:                           # 仅 backend=s3 生效
+    endpoint: ""                # 只填主机端口，如 minio.example.com:9000
     bucket: "docker-mirror-gateway"
     accessKey: ""
     secretKey: ""
-    region: ""              # MinIO 可留空；云厂商按需填写
-    prefix: "docker-mirror-gateway"   # 对象键前缀，务必保留：清理任务只会动这个前缀下的对象
-    useSSL: true            # 自建 MinIO 走明文时改成 false
-    pathStyle: false        # 自建 MinIO 一般需要 true
-    tmpDir: ""              # blob 上传前的本地暂存目录，留空用系统临时目录
+    region: ""                  # MinIO 可留空
+    prefix: "docker-mirror-gateway"   # 对象键前缀，清理任务只动此前缀
+    useSSL: true
+    pathStyle: false            # 自建 MinIO 通常 true
+    tmpDir: ""                  # blob 上传暂存目录，留空用系统临时目录
 
-# 谁能拉取镜像。只作用于拉取端口，管理端口仍由 adminToken 与端口分离保护。
-# 留空表示不限制；配置后只放行 allow 内的来源，deny 优先。
+# 谁能拉取镜像；只作用于拉取端口，管理端口由 adminToken 保护。留空不限制，deny 优先。
 access:
   allow: []
   deny: []
-  # 前面挂了 Nginx / Caddy 等反向代理时才开启，否则客户端可以伪造 X-Forwarded-For
-  trustForwardedFor: false
+  trustForwardedFor: false      # 仅反代后开启，否则客户端可伪造 X-Forwarded-For
 
-# 控制台里的镜像搜索。查询各公共仓库的公开接口。
-# hub 走 dockerhub 分组里显式配了代理的上游（hub.docker.com 境内一般只有代理能通），
-# quay、mcr 走默认直连。
-# hub、quay 有公开搜索 API；mcr 没有搜索接口，但开放了完整目录，按关键字本地匹配。
-# 其余仓库（GHCR、GCR、registry.k8s.io、Elastic、NVCR）没有匿名搜索接口，无法加入。
+# 控制台镜像搜索（查各仓库公开接口；GHCR/GCR 等无匿名搜索接口，不支持）
 search:
   enabled: true
   sources: ["hub", "quay", "mcr"]
   timeout: 8s
-  # Quay 的搜索结果不带时间，需要按仓库补查一次标签时间。
-  # 关掉可以少发请求，代价是 Quay 结果没有「更新时间」列。
-  enrichUpdated: true
-  # 按仓库补查「除 latest 外的最新版本号」，同时带出更新时间。
-  # 每个结果多一次标签接口请求（结果缓存 10 分钟），关掉可以更快。
-  enrichTags: true
+  enrichUpdated: true           # 补查 Quay 更新时间
+  enrichTags: true              # 补查最新版本号
 
 health:
-  # 健康探测间隔。最近 2 分钟内（trafficWindow）有真实拉取的上游会跳过探测，
-  # 直接复用真实流量记录的延迟与吞吐，不做重复请求。
-  interval: 1m
-  # 单次探测超时
-  timeout: 10s
-  # 连续失败达到该次数后标记为不可用（期间自动降级到下一个镜像源）
-  failThreshold: 3
-  # 有真实拉取就跳过定时探测的窗口（控制台手动「探测」不受影响）
-  # trafficWindow: 2m
+  interval: 1m                  # 探测间隔
+  timeout: 10s                  # 单次探测超时
+  failThreshold: 3              # 连续失败次数后标记不可用并降级
+  # trafficWindow: 2m           # 窗口内有真实拉取的源跳过定时探测
 
 selection:
-  # 组内选源策略：
-  # speed    —— 按实测下载吞吐排序（默认）。延迟只在吞吐接近（默认 25% 以内）
-  #             时才参与比较，而且差得不多就不换源，避免抖动。
-  # priority —— 完全按上游的 priority 排序，不做自适应。
-  # latency  —— 按实测延迟排序，差值 5ms 内再比 priority。
-  strategy: speed
-  # 吞吐探测每次下载的字节数。太小测不准（握手占比高），太大会浪费流量。
-  speedProbeBytes: 262144
-  # 给每个上游补充吞吐样本的间隔。真实拉取也会持续更新吞吐，
-  # 这里主要用于给「一直没被选中」的源定期刷新，避免它们永远排在底部。
-  # 按 35 个上游、每次 256KB 算，30 分钟一轮大约是 420MB/天；
-  # 想更快跟上源的变化就调小，代价是更多探测流量。
-  speedProbeInterval: 30m
-  # 吞吐相差多少以内算持平（0.25 = 25%）。持平后才用延迟做次级排序。
-  # 调大 → 更稳定、切换更少；调小 → 更激进地追最快的源。
-  speedTolerance: 0.25
+  strategy: speed               # speed（实测吞吐）/ priority / latency
+  speedProbeBytes: 262144       # 吞吐探测下载字节数
+  speedProbeInterval: 30m       # 给久未被选中的源刷新吞吐
+  speedTolerance: 0.25          # 吞吐差 25% 内算持平，再用延迟比较
+  preferFresh: true             # latest 优先选构建时间更新的
+  freshTags: ["latest"]         # 参与新旧比较的标签
+  freshnessTolerance: 0s        # 构建时间差小于该值视为一样新
+  freshnessTTL: 10m             # 新旧探测结果缓存时长
 
-  # latest 这类可变标签的新旧优先：
-  # 镜像源同步有延迟，最快的源不一定有最新的 latest（可能落后几天）。
-  # 开启后先比较各源上该标签的镜像构建时间，更新的优先，
-  # 时间一样才按上面的策略（速度）排序。
-  preferFresh: true
-  # 参与新旧比较的标签。版本号标签（如 1.27）在各镜像之间通常一致，
-  # 没必要为它们额外探测，所以默认只比较 latest。
-  freshTags: ["latest"]
-  # 新旧比较的容差：构建时间相差小于该值视为一样新，继续按速度选。
-  # 默认 0 表示严格优先更新的那个；不想为几分钟的差异牺牲速度时设成 1h 之类。
-  freshnessTolerance: 0s
-  # 「仓库@标签」新旧探测结果的缓存时长。同一仓库的 latest 在这段时间内
-  # 不会重复探测（每次探测约等于给每个源发 1~2 个小请求）。
-  # 探测最多占用请求 0.8s，更慢的源（如挂代理的官方源）会在后台跑完再写缓存。
-  freshnessTTL: 10m
-
-# 监控通知（默认关闭）。开启后，配置了 notify 的分组会在「健康镜像源数量
-# 跌破阈值」时发送告警，恢复后自动发一条恢复通知。
+# 监控通知（默认关闭）：健康源数低于阈值时告警，恢复后通知。
+# 模板变量：{{.Title}} {{.Text}} {{.TextJSON}} {{.State}} {{.StateText}}
+#           {{.Group}} {{.Healthy}} {{.Total}} {{.Threshold}} {{.Failing}} {{.Time}}
 notify:
-  # 总开关，默认 false
   enabled: false
-  # 同一分组持续异常时重复提醒的间隔（触发与恢复不受它限制，始终立即发）
-  interval: 30m
-  # webhook 通道，可同时配置多个。协议无关：url 与 body 都是模板，
-  # 支持 text/template 变量替换（{{.Group}} 等），飞书/企微/自建服务都能适配。
-  #   method:       GET 或 POST（默认 POST）。GET 只替换 url 模板；
-  #                 POST 替换 url 与 body，body 留空时发送结构化 JSON
-  #                 （group/state/healthy/total/threshold/failing/time 字段）。
-  #   contentType:  POST 的 Content-Type，默认 application/json。
-  #   timeout:      单次推送超时，默认 10s。
-  # 可用变量：
-  #   {{.Title}}     单行标题（如 [镜像网关·告警] 分组 dockerhub 可用镜像源 1/5（阈值 2））
-  #   {{.Text}}      完整多行文本（标题 + 时间 + 不可用源详情）
-  #   {{.TextJSON}}  JSON 转义后的完整文本（写在模板的引号内："{{.TextJSON}}"）
-  #   {{.State}}     alert / remind / recover
-  #   {{.StateText}} 告警 / 持续告警 / 恢复
-  #   {{.Group}} {{.Healthy}} {{.Total}} {{.Threshold}} {{.Time}}
-  #   {{.Failing}}   不可用源详情（多行）
-  # url 模板中的变量值会做 URL 转义，body 模板中原样嵌入。
-  # webhooks:
-  #   - method: POST                       # 飞书自定义机器人
+  interval: 30m                 # 持续异常重复提醒间隔
+  # webhooks:                   # GET 只替换 url；POST 替换 url 与 body（留空发 JSON）
+  #   - method: POST
   #     url: https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx
   #     body: '{"msg_type":"text","content":{"text":"{{.TextJSON}}"}}'
-  #   - method: POST                       # 企业微信群机器人
-  #     url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
-  #     body: '{"msgtype":"text","text":{"content":"{{.TextJSON}}"}}'
-  #   - method: GET                        # 自建服务，只通过 query 传参
-  #     url: https://ops.example.com/hooks/mirror?group={{.Group}}&healthy={{.Healthy}}&state={{.State}}
-  # SMTP 邮件通道（可选，与 webhook 并存）
+  #   - method: GET
+  #     url: https://ops.example.com/hooks/mirror?group={{.Group}}&healthy={{.Healthy}}
   # email:
   #   enabled: true
   #   host: smtp.example.com
-  #   port: 465            # 465 走隐式 TLS；587/25 尝试 STARTTLS
+  #   port: 465                 # 465 隐式 TLS；587/25 尝试 STARTTLS
   #   username: user@example.com
   #   password: "******"
   #   from: user@example.com
   #   to: [me@example.com]
 
 routing:
-  # 没有域名/路径前缀线索时，并发探测各分组，自动判断仓库属于哪个仓库。
-  # 关闭后所有未匹配请求都会落到 defaultGroup。
-  autoDetect: true
-  # 启用仓库路径首段的别名，例如 /ghcr.io/owner/app、/quay/org/app。
-  pathAliases: true
-  # 自动探测的胜出规则：
-  # priority：分组 priority 数值小者胜（结果稳定，推荐）
-  # fastest：最快响应的分组胜（跨地域部署时更快，但同名仓库可能有歧义）
-  strategy: priority
-  # 兜底分组：autoDetect 关闭或无法判定时使用。
-  defaultGroup: dockerhub
-  # 单次自动探测的总超时（各分组并发探测，通常几百毫秒）
-  detectTimeout: 5s
-  # 「仓库 -> 分组」判定结果的缓存时长
-  routeTTL: 30m
-  # 「仓库不存在」的负缓存时长，避免反复探测
-  negativeTTL: 2m
+  autoDetect: true              # 无域名/路径线索时并发探测，自动判断仓库归属
+  pathAliases: true             # 启用 /ghcr.io/owner/app 这类路径首段别名
+  strategy: priority            # priority（数值小者胜）/ fastest
+  defaultGroup: dockerhub       # 无法判定时的兜底分组
+  detectTimeout: 5s             # 单次自动探测总超时
+  routeTTL: 30m                 # 仓库 -> 分组判定缓存
+  negativeTTL: 2m               # 仓库不存在的负缓存
 
+# 每个分组对应一个公共仓库，组内多个加速源按 selection.strategy 自动选最快的。
+# 预置源均为第三方免费服务，可能限速或下线，health 检查会自动降级。
 groups:
-  # 说明：下面每个分组都预置了若干个境内公共加速源，来源是 status.anye.xyz
-  # 的在线监控 + 本机实测吞吐，只保留「在线、无需登录/内网、公共可访问」的。
-  # 它们都是第三方免费服务，可能限速、变更或下线；health 检查会自动降级。
-  #
-  # 下面的 priority 只是「初始猜测 + 兜底顺序」：selection.strategy 为 speed 时，
-  # 排序由实时测得的下载吞吐决定，priority 只在吞吐持平或还没有样本时生效。
-  # 所以你不用手工维护这里的数值，跑起来之后它会自己收敛到最快的源。
-  #
-  # ---------------------------------------------------------------- Docker Hub
   - name: dockerhub
-    # 分组优先级：自动路由出现歧义时，数值小者胜
-    priority: 10
+    priority: 10                # 自动路由有歧义时数值小者胜
     default: true
-    # 路径前缀别名：mirror/docker.io/library/nginx
     aliases: ["dockerhub", "docker.io", "registry-1.docker.io", "index.docker.io"]
-    # 请求域名（反向代理保留原始 Host、或 DNS 指向本服务时生效）。
-    # 开启 auth.passthrough 时，这里绑定的域名就是该分组凭证的边界：
-    # docker login docker.example.com 的凭证只会发给本组上游。
-    # hosts: ["docker.example.com"]
+    # hosts: ["docker.example.com"]   # 按请求域名路由到本分组（多域名部署用）
     hosts: ["docker.io", "registry-1.docker.io"]
-    # 单段镜像名补全：nginx -> library/nginx
-    libraryNamespace: library
-    # 健康探针必须是一个真实存在的镜像
-    probeRepo: library/alpine
+    libraryNamespace: library   # 单段镜像名补全：nginx -> library/nginx
+    probeRepo: library/alpine   # 健康探针须为真实存在的镜像
     probeTag: latest
-    # 分组监控通知（还需要全局 notify.enabled: true）：
-    # 健康镜像源数量少于 minHealthy 时告警，恢复后自动通知。默认 0 = 不通知。
-    # notify:
+    # notify:                   # 需全局 notify.enabled: true
     #   enabled: true
     #   minHealthy: 1
     upstreams:
-      # 优先级按 2026-11 独立拉取的实测吞吐排序（直接连源，不经本服务）；
-      # 经本服务拉取时大镜像通常更快。健康检查会自动跳过挂掉或变慢的源。
       - name: dockerhub-sparkcr
         url: https://docker.sparkcr.cn
-        priority: 10        # 实测 ~950KB/s，manifest 90ms
+        priority: 10
       - name: dockerhub-1ms
         url: https://docker.1ms.run
-        priority: 20        # 实测 ~290KB/s（blob 走 Cloudflare CDN）
+        priority: 20
       - name: dockerhub-daocloud
         url: https://docker.m.daocloud.io
-        priority: 30        # 实测 ~330KB/s，有速率限制
+        priority: 30
       - name: dockerhub-1panel
         url: https://docker.1panel.live
-        priority: 40        # 实测 ~290KB/s
+        priority: 40
       - name: dockerhub
         url: https://registry-1.docker.io
         priority: 100
-        # 填写 Docker Hub 账号可提高拉取配额
-        # username: ""
+        # auth: passthrough     # 默认 config：用本源 username/password 认证；
+                                # passthrough 把客户端凭证原样发给该源，仅完全信任的官方源开启
+        # username: ""          # 填 Docker Hub 账号可提高配额（config 模式）
         # password: ""
-        # 该源单独走代理（和 group 内其他源互不影响）：
-        # proxy: "http://127.0.0.1:7890"
-        # proxy: "socks5h://127.0.0.1:1080"     # 也支持 socks5
-        # proxy: "direct"    # 强制直连，忽略环境变量里的代理
-        # 不写 proxy 则沿用 HTTP_PROXY / HTTPS_PROXY / NO_PROXY
-        #
-        # 代理需要认证时，账号密码可以写在地址里：
-        # proxy: "socks5://user:pass@127.0.0.1:1080"
-        # 也可以拆成两个字段（密码里有 @ / : / # 时更省事，不用做 URL 转义）：
-        # proxy: "socks5://127.0.0.1:1080"
-        # proxyUsername: "user"
+        # proxy: "http://127.0.0.1:7890"         # 单源代理；也支持 socks5h://、direct
+        # proxyUsername: "user"                  # 代理认证，也可写进 URL
         # proxyPassword: "${PROXY_PASSWORD}"
-        # 两种写法只能选一种，同时配置会报错。
 
-  # --------------------------------------------------------------------- GHCR
   - name: ghcr
     priority: 20
     aliases: ["ghcr", "ghcr.io"]
@@ -280,21 +137,19 @@ groups:
     probeRepo: stefanprodan/podinfo
     probeTag: latest
     upstreams:
-      # 南京大学 e-Science 镜像站，实测最快且口碑最好的一档
       - name: ghcr-nju
         url: https://ghcr.nju.edu.cn
-        priority: 10        # 实测 ~3.4MB/s
+        priority: 10
       - name: ghcr-sparkcr
         url: https://ghcr.sparkcr.cn
-        priority: 20        # 实测 ~220KB/s
+        priority: 20
       - name: ghcr-dockerproxy
         url: https://ghcr.dockerproxy.net
-        priority: 30        # 实测 ~210KB/s
+        priority: 30
       - name: ghcr
         url: https://ghcr.io
         priority: 100
 
-  # --------------------------------------------------------------------- Quay
   - name: quay
     priority: 30
     aliases: ["quay", "quay.io"]
@@ -304,45 +159,40 @@ groups:
     upstreams:
       - name: quay-nju
         url: https://quay.nju.edu.cn
-        priority: 10        # 实测 ~2.2MB/s
+        priority: 10
       - name: quay-sparkcr
         url: https://quay.sparkcr.cn
-        priority: 20        # 实测 ~900KB/s
+        priority: 20
       - name: quay-dockerproxy
         url: https://quay.dockerproxy.net
-        priority: 30        # 实测 ~260KB/s
+        priority: 30
       - name: quay-daocloud
         url: https://quay.m.daocloud.io
-        priority: 40        # 实测 ~250KB/s
+        priority: 40
       - name: quay
         url: https://quay.io
         priority: 100
 
-  # ------------------------------------------- Microsoft Container Registry
   - name: mcr
     priority: 40
     aliases: ["mcr", "mcr.microsoft.com"]
     hosts: ["mcr.microsoft.com"]
-    # 注意：hello-world 的层只有几 KB，够不到 64KB 的吞吐样本门槛，
-    # 所以这个分组通常拿不到速度数据，会一直按下面的 priority 排序。
-    # 真实拉取过大镜像后就会有样本了。
-    probeRepo: hello-world
+    probeRepo: hello-world       # hello-world 层太小拿不到吞吐样本，此组通常按 priority 排
     probeTag: latest
     upstreams:
       - name: mcr-sparkcr
         url: https://mcr.sparkcr.cn
-        priority: 10        # 实测 ~540KB/s，manifest 200ms
+        priority: 10
       - name: mcr-dockerproxy
         url: https://mcr.dockerproxy.net
-        priority: 20        # 大 blob 约 5MB/s，但 manifest 要 1.2s；综合不如 sparkcr
+        priority: 20
       - name: mcr-daocloud
         url: https://mcr.m.daocloud.io
-        priority: 30        # 实测 ~320KB/s
+        priority: 30
       - name: mcr
         url: https://mcr.microsoft.com
         priority: 100
 
-  # ------------------------------------- Kubernetes registry.k8s.io / k8s.gcr.io
   - name: k8s
     priority: 50
     aliases: ["k8s", "registry.k8s.io", "k8s.gcr.io"]
@@ -352,21 +202,20 @@ groups:
     upstreams:
       - name: k8s-nju
         url: https://k8s.nju.edu.cn
-        priority: 10        # 实测 ~1.7MB/s
+        priority: 10
       - name: k8s-sparkcr
         url: https://k8s.sparkcr.cn
-        priority: 20        # 实测 ~570KB/s
+        priority: 20
       - name: k8s-daocloud
         url: https://k8s.m.daocloud.io
-        priority: 30        # 实测 ~150KB/s
+        priority: 30
       - name: k8s-dockerproxy
         url: https://k8s.dockerproxy.net
-        priority: 40        # 实测 ~150KB/s
+        priority: 40
       - name: k8s
         url: https://registry.k8s.io
         priority: 100
 
-  # ---------------------------------------------------- Google Container Registry
   - name: gcr
     priority: 60
     aliases: ["gcr", "gcr.io", "marketplace.gcr.io"]
@@ -376,21 +225,20 @@ groups:
     upstreams:
       - name: gcr-nju
         url: https://gcr.nju.edu.cn
-        priority: 10        # 实测 ~780KB/s
+        priority: 10
       - name: gcr-sparkcr
         url: https://gcr.sparkcr.cn
-        priority: 20        # 实测 ~240KB/s
+        priority: 20
       - name: gcr-daocloud
         url: https://gcr.m.daocloud.io
-        priority: 30        # 实测 ~60KB/s
+        priority: 30
       - name: gcr-dockerproxy
         url: https://gcr.dockerproxy.net
-        priority: 40        # 实测 ~40KB/s
+        priority: 40
       - name: gcr
         url: https://gcr.io
         priority: 100
 
-  # ------------------------------------------------------ Elastic Registry
   - name: elastic
     priority: 70
     aliases: ["elastic", "docker.elastic.co"]
@@ -400,15 +248,14 @@ groups:
     upstreams:
       - name: elastic-sparkcr
         url: https://elastic.sparkcr.cn
-        priority: 10        # 实测 ~320KB/s
+        priority: 10
       - name: elastic-daocloud
         url: https://elastic.m.daocloud.io
-        priority: 20        # 实测 ~190KB/s
+        priority: 20
       - name: elastic
         url: https://docker.elastic.co
         priority: 100
 
-  # ------------------------------------------------------------ NVIDIA NVCR
   - name: nvcr
     priority: 80
     aliases: ["nvcr", "nvcr.io"]
@@ -416,16 +263,15 @@ groups:
     probeRepo: nvidia/cuda
     probeTag: "12.4.1-base-ubuntu22.04"
     upstreams:
-      # 注意：南大的 NGC 镜像挂在 ngc.nju.edu.cn（不是 nvcr. 前缀）
-      - name: nvcr-nju
+      - name: nvcr-nju          # 南大 NGC 域名是 ngc.nju.edu.cn
         url: https://ngc.nju.edu.cn
-        priority: 10        # 实测 ~1.6MB/s
+        priority: 10
       - name: nvcr-sparkcr
         url: https://nvcr.sparkcr.cn
-        priority: 20        # 实测 ~320KB/s
+        priority: 20
       - name: nvcr-daocloud
         url: https://nvcr.m.daocloud.io
-        priority: 30        # 实测 ~190KB/s
+        priority: 30
       - name: nvcr
         url: https://nvcr.io
         priority: 100

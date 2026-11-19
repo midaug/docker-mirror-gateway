@@ -55,7 +55,6 @@ func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(),
 // Config 是 docker-mirror-gateway 的完整配置。
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
-	Auth      AuthConfig      `yaml:"auth"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Access    AccessConfig    `yaml:"access"`
 	Search    SearchConfig    `yaml:"search"`
@@ -177,10 +176,20 @@ type GroupNotifyConfig struct {
 	MinHealthy int `yaml:"minHealthy"`
 }
 
+// 上游认证方式。默认 config：使用本源配置的 username/password 自动完成
+// 上游认证；passthrough：把客户端 docker login 的凭证原样用于该源。
+const (
+	UpstreamAuthConfig      = "config"
+	UpstreamAuthPassthrough = "passthrough"
+)
+
 type UpstreamConfig struct {
-	Name     string            `yaml:"name"`
-	URL      string            `yaml:"url"`
-	Priority int               `yaml:"priority"`
+	Name     string `yaml:"name"`
+	URL      string `yaml:"url"`
+	Priority int    `yaml:"priority"`
+	// Auth 是该源的认证方式：config（默认）或 passthrough。
+	// 认证方式严格属于单个源，不按分组或域名推断。
+	Auth     string            `yaml:"auth"`
 	Username string            `yaml:"username"`
 	Password string            `yaml:"password"`
 	Timeout  Duration          `yaml:"timeout"`
@@ -197,6 +206,9 @@ type UpstreamConfig struct {
 	ProxyPassword string `yaml:"proxyPassword"`
 }
 
+// Passthrough 报告该源是否使用客户端凭证透传。
+func (u UpstreamConfig) Passthrough() bool { return u.Auth == UpstreamAuthPassthrough }
+
 type ServerConfig struct {
 	// Addr 是镜像拉取端口（/v2/*）。
 	Addr string `yaml:"addr"`
@@ -210,18 +222,6 @@ type ServerConfig struct {
 	ReadHeaderTimeout Duration `yaml:"readHeaderTimeout"`
 	IdleTimeout       Duration `yaml:"idleTimeout"`
 	MaxManifestBytes  int64    `yaml:"maxManifestBytes"`
-}
-
-// AuthConfig 是客户端认证透传的配置。
-type AuthConfig struct {
-	// Passthrough 开启认证透传：客户端 docker login 后的凭证会被转发给上游，
-	// 用于访问私有镜像或提升匿名拉取配额。只对配置了 hosts（多域名模式）的
-	// 分组生效——单域名按路径区分分组时会把凭证发给错误的组，因此不透传。
-	// 默认 false（本地部署、个人使用无需开启）。
-	Passthrough bool `yaml:"passthrough"`
-	// PublicURL 是改写后的令牌服务对外基准地址（如 https://docker.example.com）。
-	// 留空按请求的 Host 与 X-Forwarded-Proto 推导；多域名部署推荐留空。
-	PublicURL string `yaml:"publicURL"`
 }
 
 type CacheConfig struct {
@@ -433,9 +433,13 @@ func Load(path string) (*Config, error) {
 			var keys struct {
 				Group  yaml.Node `yaml:"group"`
 				Groups yaml.Node `yaml:"groups"`
+				Auth   yaml.Node `yaml:"auth"`
 			}
 			if err := yaml.Unmarshal([]byte(expanded), &keys); err != nil {
 				return nil, fmt.Errorf("解析配置文件 %s 失败: %w", path, err)
+			}
+			if keys.Auth.Kind != 0 {
+				return nil, errors.New("全局 auth 配置已移除：请在每个 upstream 上设置 auth: config 或 auth: passthrough")
 			}
 			hasGroup := keys.Group.Kind != 0
 			hasGroups := keys.Groups.Kind != 0
@@ -471,11 +475,6 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("MIRROR_GATEWAY_ADMIN_TOKEN"); v != "" {
 		c.Server.AdminToken = v
-	}
-	if v := os.Getenv("MIRROR_GATEWAY_AUTH_PASSTHROUGH"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Auth.Passthrough = b
-		}
 	}
 	if v := os.Getenv("MIRROR_GATEWAY_CACHE_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -877,6 +876,20 @@ func (c *Config) validateGroups() error {
 				return fmt.Errorf("上游名称 %q 重复（分组 %q 与 %q），请改为全局唯一", u.Name, owner, g.Name)
 			}
 			upstreamNames[u.Name] = g.Name
+
+			u.Auth = strings.ToLower(strings.TrimSpace(u.Auth))
+			switch u.Auth {
+			case "":
+				u.Auth = UpstreamAuthConfig
+			case UpstreamAuthConfig, UpstreamAuthPassthrough:
+			default:
+				return fmt.Errorf("upstream %q 的 auth 仅支持 %s 或 %s，当前为 %q",
+					u.Name, UpstreamAuthConfig, UpstreamAuthPassthrough, u.Auth)
+			}
+			if u.Auth == UpstreamAuthPassthrough && (u.Username != "" || u.Password != "") {
+				return fmt.Errorf("upstream %q 的 auth=%s 时不能再配置 username/password（两种认证方式互斥）",
+					u.Name, UpstreamAuthPassthrough)
+			}
 
 			u.URL = strings.TrimSpace(strings.TrimRight(u.URL, "/"))
 			parsed, err := url.Parse(u.URL)

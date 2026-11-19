@@ -94,6 +94,25 @@ group:
 	}
 }
 
+func TestLoadRejectsLegacyGlobalAuth(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+auth:
+  passthrough: true
+group:
+  upstreams:
+    - name: first
+      url: https://first.example.com
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "全局 auth 配置已移除") {
+		t.Fatalf("旧全局 auth 配置应被拒绝并提示迁移, err=%v", err)
+	}
+}
+
 func TestLoadMissingExplicitFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "not-exists.yaml")); err == nil {
 		t.Fatal("显式指定不存在的配置文件应返回错误")
@@ -405,6 +424,41 @@ func TestValidateProxyAndAdminAddr(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("proxy %q 应被拒绝", spec)
 		}
+	}
+}
+
+func TestUpstreamAuthMode(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := cfg.Groups[0].Upstreams[0].Auth; got != UpstreamAuthConfig {
+		t.Errorf("默认 auth = %q, 期望 %q", got, UpstreamAuthConfig)
+	}
+	if cfg.Groups[0].Upstreams[0].Passthrough() {
+		t.Error("默认不应开启透传")
+	}
+
+	pass := Default()
+	pass.Group.Upstreams[0].Auth = " PASSTHROUGH "
+	if err := pass.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !pass.Groups[0].Upstreams[0].Passthrough() {
+		t.Error("auth=passthrough 应归一化并生效")
+	}
+
+	bad := Default()
+	bad.Group.Upstreams[0].Auth = "basic"
+	if err := bad.Validate(); err == nil {
+		t.Error("未知认证方式应报错")
+	}
+
+	conflict := Default()
+	conflict.Group.Upstreams[0].Auth = UpstreamAuthPassthrough
+	conflict.Group.Upstreams[0].Username = "someone"
+	if err := conflict.Validate(); err == nil {
+		t.Error("透传与配置账号同时存在时应报错")
 	}
 }
 
