@@ -45,10 +45,14 @@ type fakeRegistry struct {
 	unauthorizedRepos map[string]bool // 这些仓库返回 401 authentication required
 	wrapNotFound      bool            // 把 404 包装成 500 UNKNOWN（模拟 dockerproxy）
 	tokenDeniedScopes map[string]bool // token 接口对这些 scope 返回 403（模拟 ghcr.io）
+	tokenUser         string          // token 接口要求的 Basic 账号（空 = 不校验）
+	tokenPass         string
 	manifestReqs      atomic.Int64
 	blobReqs          atomic.Int64
 	tagsReqs          atomic.Int64
 	seen              atomic.Value
+	lastAuth          atomic.Value // 数据接口最近一次收到的 Authorization
+	lastTokenAuth     atomic.Value // token 接口最近一次收到的 Authorization
 }
 
 // writeWrappedNotFound 模拟 dockerproxy 把 404 包装成 500 UNKNOWN 的响应，
@@ -69,6 +73,7 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		f.lastTokenAuth.Store(r.Header.Get("Authorization"))
 		// 模拟 token 接口对特定仓库 scope 返回 403 DENIED（ghcr.io 对
 		// 不存在仓库的匿名令牌请求行为）
 		if f.tokenDeniedScopes[r.URL.Query().Get("scope")] {
@@ -76,8 +81,17 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 			_, _ = io.WriteString(w, `{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}`)
 			return
 		}
+		if f.tokenUser != "" {
+			// 模拟真实 registry：只有用正确账号换 token 才发放有效凭证
+			if u, p, ok := r.BasicAuth(); !ok || u != f.tokenUser || p != f.tokenPass {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s/token"`, f.Server.URL))
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`)
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"token":"test-token","expires_in":300}`)
+		_, _ = io.WriteString(w, `{"token":"`+f.token+`","expires_in":300}`)
 	})
 	mux.HandleFunc("/v2/", f.handle)
 	f.Server = httptest.NewServer(mux)
@@ -93,6 +107,7 @@ func (f *fakeRegistry) addManifest(name, ref string, mediaType string, body []by
 }
 
 func (f *fakeRegistry) handle(w http.ResponseWriter, r *http.Request) {
+	f.lastAuth.Store(r.Header.Get("Authorization"))
 	if f.token != "" && r.Header.Get("Authorization") != "Bearer "+f.token {
 		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token",service="fake-registry"`, f.Server.URL))
 		w.WriteHeader(http.StatusUnauthorized)
@@ -767,5 +782,69 @@ func TestProxyManifestAllTokenDenied(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "MANIFEST_UNKNOWN") {
 		t.Errorf("错误码不符合 Registry 规范: %s", rec.Body.String())
+	}
+}
+
+// docker login 到网关的客户端凭证（Authorization: Basic ...）绝不能被转发到
+// 上游：上游认证只能来自配置文件里该 upstream 的 username/password。否则
+// 登录 dockerhub 组的凭证会被带去访问 quay/ghcr 等组的上游，轻则认证失败，
+// 重则把用户的真实账号密码泄漏给无关镜像源。
+func TestProxyClientCredentialsNotForwarded(t *testing.T) {
+	f := newFakeRegistry(t)
+	f.addManifest("library/nginx", "latest", MediaTypeDockerManifest,
+		[]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{}}`))
+
+	c := newTestCache(t)
+	// 上游未配置 username/password（最常见场景）
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "fake", URL: f.URL, Priority: 10},
+	}, c)
+
+	// 模拟 docker login 后的拉取请求：docker 会带上 Basic 凭证
+	req := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil)
+	req.SetBasicAuth("docker-login-user", "docker-login-password")
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, req, "library/nginx", "latest")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 上游数据接口收到的应是网关自己换的 Bearer token，绝不是客户端凭证
+	got, _ := f.lastAuth.Load().(string)
+	if got != "Bearer test-token" {
+		t.Errorf("上游收到的 Authorization = %q, 期望 \"Bearer test-token\"（客户端凭证不得透传）", got)
+	}
+	// token 接口同样不得收到客户端凭证（该上游未配置账号，应完全没有 Authorization）
+	if got := f.lastTokenAuth.Load(); got != nil && got != "" {
+		t.Errorf("token 接口收到 Authorization = %v, 期望空", got)
+	}
+}
+
+// 上游配置了自己的账号时，客户端凭证也不应覆盖它：上游收到的必须是基于
+// 配置账号换取的 token。
+func TestProxyClientCredentialsVsUpstreamConfig(t *testing.T) {
+	f := newFakeRegistry(t)
+	f.token = "upstream-config-token"
+	f.tokenUser, f.tokenPass = "cfg-user", "cfg-pass"
+	f.addManifest("library/nginx", "latest", MediaTypeDockerManifest,
+		[]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{}}`))
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "fake", URL: f.URL, Priority: 10, Username: "cfg-user", Password: "cfg-pass"},
+	}, c)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil)
+	req.SetBasicAuth("docker-login-user", "docker-login-password")
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, req, "library/nginx", "latest")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ := f.lastAuth.Load().(string)
+	if got != "Bearer upstream-config-token" {
+		t.Errorf("上游收到的 Authorization = %q, 期望配置账号换的 token", got)
 	}
 }
