@@ -96,7 +96,6 @@ data:
 | `access.deny` | 空 | 明确拒绝的来源，优先于 `allow` |
 | `access.trustForwardedFor` | `false` | 是否采信 `X-Forwarded-For`（取链尾地址，即反代追加的真实客户端 IP） |
 | `search.enabled` | `true` | 控制台镜像搜索 |
-
 | `search.sources` | `[hub, quay, mcr]` | 搜索哪些仓库 |
 | `search.timeout` | `8s` | 单次搜索总超时 |
 | `search.enrichUpdated` | `true` | 是否补查 Quay 的更新时间 |
