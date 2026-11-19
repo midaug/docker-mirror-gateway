@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -175,10 +177,32 @@ func NewUpstream(cfg config.UpstreamConfig, group string, failThreshold int, log
 // Do 向上游发起请求，并在遇到 401 时自动完成 Bearer/Basic 认证后重试一次。
 // scope 形如 repository:library/nginx:pull。
 func (u *Upstream) Do(ctx context.Context, method, path string, header http.Header, scope string) (*http.Response, error) {
+	resp, _, err := u.DoAuth(ctx, method, path, header, scope, "")
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		// 401 且带挑战的出口只发生在需要透传的场景；Do 的调用方不需要。
+		return nil, fmt.Errorf("%w: %s 需要认证", ErrUnauthorized, u.Name)
+	}
+	return resp, nil
+}
+
+// DoAuth 在 Do 的基础上支持客户端凭证透传，供认证透传模式使用：
+//
+//   - clientAuth 非空：直接作为 Authorization 头发给上游（不查网关令牌缓存、
+//     不用配置账号）；上游返回 401 且带挑战时不自动重试，而是返回 challenge
+//     由上层改写后透传给客户端（docker 会自己去换令牌）。
+//   - clientAuth 为空：与 Do 相同的网关代管认证；自动换取失败时把上游原始
+//     挑战放在 challenge 里带回，透传模式下上层可转给客户端。
+//
+// challenge 仅在上游返回 401 且响应携带 WWW-Authenticate 时非空（此时 resp
+// 为 nil、body 已关闭）。非透传调用方应忽略 challenge 并按 err/resp 处理。
+func (u *Upstream) DoAuth(ctx context.Context, method, path string, header http.Header, scope, clientAuth string) (*http.Response, string, error) {
 	u.reqTotal.Add(1)
 	u.mReq.Inc()
 
-	attempt := func(token string, basic bool) (*http.Response, error) {
+	attempt := func(authorization string) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, method, u.BaseURL+path, nil)
 		if err != nil {
 			return nil, err
@@ -192,26 +216,52 @@ func (u *Upstream) Do(ctx context.Context, method, path string, header http.Head
 			req.Header.Set(key, value)
 		}
 		req.Header.Set("User-Agent", userAgent)
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		} else if basic {
-			req.SetBasicAuth(u.username, u.password)
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
 		}
 		return u.client.Do(req)
 	}
+	// 读取 401 响应并返回原始挑战头。
+	readChallenge := func(resp *http.Response) string {
+		ch := resp.Header.Get("WWW-Authenticate")
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return ch
+	}
+
+	// 客户端凭证透传：完全以客户端身份访问上游，401 时把挑战交还上层。
+	if clientAuth != "" {
+		resp, err := attempt(clientAuth)
+		if err != nil {
+			return nil, "", err
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			ch := readChallenge(resp)
+			if ch != "" {
+				return nil, ch, nil
+			}
+			return nil, "", fmt.Errorf("%w: %s 返回 401 且未提供可用的认证挑战", ErrUnauthorized, u.Name)
+		}
+		return resp, "", nil
+	}
 
 	token := u.tokens.get(scope)
-	resp, err := attempt(token, token == "" && u.username != "")
+	auth := ""
+	if token != "" {
+		auth = "Bearer " + token
+	} else if u.username != "" {
+		auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(u.username+":"+u.password))
+	}
+	resp, err := attempt(auth)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
-		return resp, nil
+		return resp, "", nil
 	}
 
-	ch := parseChallenge(resp.Header.Get("WWW-Authenticate"))
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	resp.Body.Close()
+	rawChallenge := readChallenge(resp)
+	ch := parseChallenge(rawChallenge)
 	u.tokens.invalidate(scope)
 
 	switch ch.Scheme {
@@ -220,18 +270,109 @@ func (u *Upstream) Do(ctx context.Context, method, path string, header http.Head
 		newToken, ttl, err := u.fetchToken(ctx, ch, scope)
 		u.log.Debug("换取上游令牌", "elapsed", time.Since(tokenStart).Round(time.Millisecond).String(), "err", err)
 		if err != nil {
-			return nil, err
+			// 换取失败时把上游原始挑战带回：透传模式下可转给客户端，
+			// 让它自己完成认证（私有仓库、配额场景）。
+			return nil, rawChallenge, err
 		}
 		u.tokens.put(scope, newToken, ttl)
-		return attempt(newToken, false)
+		resp, err := attempt("Bearer " + newToken)
+		if err == nil && resp.StatusCode == http.StatusUnauthorized {
+			ch := readChallenge(resp)
+			if ch != "" {
+				return nil, ch, nil
+			}
+		}
+		return resp, "", err
 	case "basic":
 		if u.username == "" {
-			return nil, fmt.Errorf("%w: %s 需要 Basic 认证，但未配置账号", ErrUnauthorized, u.Name)
+			return nil, rawChallenge, fmt.Errorf("%w: %s 需要 Basic 认证，但未配置账号", ErrUnauthorized, u.Name)
 		}
-		return attempt("", true)
+		resp, err := attempt("Basic " + base64.StdEncoding.EncodeToString([]byte(u.username+":"+u.password)))
+		if err == nil && resp.StatusCode == http.StatusUnauthorized {
+			ch := readChallenge(resp)
+			if ch != "" {
+				return nil, ch, nil
+			}
+		}
+		return resp, "", err
 	default:
-		return nil, fmt.Errorf("%w: %s 返回 401 且未提供可用的认证挑战", ErrUnauthorized, u.Name)
+		return nil, rawChallenge, fmt.Errorf("%w: %s 返回 401 且未提供可用的认证挑战", ErrUnauthorized, u.Name)
 	}
+}
+
+// Challenge 请求上游 /v2/ 并解析认证挑战。令牌代理（ServeToken）用它获得
+// 上游真实的 realm 与 service，确保客户端凭证只发给该上游自己的令牌服务。
+func (u *Upstream) Challenge(ctx context.Context) (challenge, error) {
+	u.reqTotal.Add(1)
+	u.mReq.Inc()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.BaseURL+"/v2/", nil)
+	if err != nil {
+		return challenge{}, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return challenge{}, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode == http.StatusOK {
+		// 该源无需认证，客户端凭证无处可用。
+		return challenge{}, fmt.Errorf("%w: %s 无需认证", ErrUnauthorized, u.Name)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return challenge{}, fmt.Errorf("%w: %s 返回 %d", ErrUnauthorized, u.Name, resp.StatusCode)
+	}
+	ch := parseChallenge(resp.Header.Get("WWW-Authenticate"))
+	if ch.Realm == "" {
+		return challenge{}, fmt.Errorf("%w: %s 认证挑战缺少 realm", ErrUnauthorized, u.Name)
+	}
+	return ch, nil
+}
+
+// ForwardToken 带客户端凭证请求上游令牌接口，返回原始 JSON 响应体。
+// 与 fetchToken 的区别：认证用透传的客户端凭证而非网关配置账号，且结果
+// 不进网关令牌缓存（令牌属于客户端，由客户端自己缓存与续期）。
+func (u *Upstream) ForwardToken(ctx context.Context, ch challenge, scope, clientAuth string) ([]byte, error) {
+	if ch.Realm == "" {
+		return nil, fmt.Errorf("%w: 缺少认证 realm", ErrUnauthorized)
+	}
+	q := url.Values{}
+	q.Set("client_id", "docker-mirror-gateway")
+	if ch.Service != "" {
+		q.Set("service", ch.Service)
+	}
+	if scope != "" {
+		q.Set("scope", scope)
+	}
+	realm := ch.Realm
+	if strings.Contains(realm, "?") {
+		realm += "&" + q.Encode()
+	} else {
+		realm += "?" + q.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realm, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", userAgent)
+	if clientAuth != "" {
+		req.Header.Set("Authorization", clientAuth)
+	}
+	resp, err := u.tokenClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求令牌失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: 令牌接口返回 %d: %s", ErrUnauthorized, resp.StatusCode, snippet(body))
+	}
+	return body, nil
 }
 
 // Ping 探测 /v2/ 端点。200 和 401 都说明服务在线。

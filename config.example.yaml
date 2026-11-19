@@ -32,6 +32,17 @@ server:
   # 单个 manifest 的大小上限（默认 8MB）
   maxManifestBytes: 8388608
 
+# 认证透传（公网多域名部署可选，本地部署保持默认关闭）。
+# 开启后客户端 docker login 的凭证会转发给上游：可用于拉私有镜像、
+# 用自己的 Docker Hub 账号提升匿名拉取配额。
+# 只对配置了 hosts 的分组生效——单域名按路径区分分组时凭证会被发给
+# 错误的组，因此每个要透传的分组都必须绑定自己的域名。
+# 详细说明见 docs/configuration.md 的 auth 段。
+auth:
+  passthrough: false
+  # 改写后的令牌服务对外基准地址；留空按请求 Host 推导（多域名推荐留空）。
+  # publicURL: "https://docker.example.com"
+
 cache:
   # 缓存总开关，默认关闭：所有请求直接回源。
   # 个人部署往往没有大流量，不占一块磁盘反而更省心；
@@ -211,7 +222,10 @@ groups:
     default: true
     # 路径前缀别名：mirror/docker.io/library/nginx
     aliases: ["dockerhub", "docker.io", "registry-1.docker.io", "index.docker.io"]
-    # 请求域名（反向代理保留原始 Host、或 DNS 指向本服务时生效）
+    # 请求域名（反向代理保留原始 Host、或 DNS 指向本服务时生效）。
+    # 开启 auth.passthrough 时，这里绑定的域名就是该分组凭证的边界：
+    # docker login docker.example.com 的凭证只会发给本组上游。
+    # hosts: ["docker.example.com"]
     hosts: ["docker.io", "registry-1.docker.io"]
     # 单段镜像名补全：nginx -> library/nginx
     libraryNamespace: library

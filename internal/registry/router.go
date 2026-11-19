@@ -102,6 +102,9 @@ type Router struct {
 	routeTTL      time.Duration
 	negativeTTL   time.Duration
 
+	passthrough bool
+	publicURL   string
+
 	cache  *routeCache
 	notify *notify.Manager
 	log    *slog.Logger
@@ -127,6 +130,8 @@ func NewRouter(cfg *config.Config, log *slog.Logger, m *metrics.Collector) (*Rou
 		detectTimeout: cfg.Routing.DetectTimeout.D(),
 		routeTTL:      cfg.Routing.RouteTTL.D(),
 		negativeTTL:   cfg.Routing.NegativeTTL.D(),
+		passthrough:   cfg.Auth.Passthrough,
+		publicURL:     cfg.Auth.PublicURL,
 		cache:         newRouteCache(8192),
 		log:           log,
 	}
@@ -219,6 +224,32 @@ func (r *Router) Groups() []*Group {
 
 // DefaultGroup 返回兜底分组。
 func (r *Router) DefaultGroup() *Group { return r.def }
+
+// PassthroughFor 判断该分组是否启用认证透传。需要同时满足：
+// 全局开关 auth.passthrough 且分组配置了 hosts（多域名模式）。
+// 单域名按路径区分分组时，客户端凭证会被发给错误的组（登录 Docker Hub 的
+// 密码带给 ghcr 源），因此多域名是透传的前提。
+func (r *Router) PassthroughFor(g *Group) bool {
+	return r.passthrough && len(g.Hosts) > 0
+}
+
+// PublicOrigin 返回对外基准地址：优先配置的 auth.publicURL，否则按请求的
+// Host 与 X-Forwarded-Proto 推导（多域名部署天然按域名各自正确）。
+func (r *Router) PublicOrigin(req *http.Request) string {
+	if r.publicURL != "" {
+		return strings.TrimRight(r.publicURL, "/")
+	}
+	scheme := "http"
+	if req != nil {
+		if req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		if req.Host != "" {
+			return scheme + "://" + req.Host
+		}
+	}
+	return scheme + "://localhost"
+}
 
 // AutoDetect 返回是否开启了自动探测。
 func (r *Router) AutoDetect() bool { return r.auto }

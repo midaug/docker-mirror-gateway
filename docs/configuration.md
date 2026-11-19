@@ -79,6 +79,31 @@
 | `access.deny` | 空 | 明确拒绝的来源，优先于 `allow` |
 | `access.trustForwardedFor` | `false` | 是否采信 `X-Forwarded-For` |
 | `search.enabled` | `true` | 控制台镜像搜索 |
+
+## auth（认证透传，公网部署可选）
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `auth.passthrough` | `false` | 开启后客户端 `docker login` 的凭证会转发给上游（私有镜像、提升匿名拉取配额）。**只对配置了 `hosts`（多域名模式）的分组生效**——单域名按路径区分分组时凭证会被发给错误的组，因此多域名是透传的前提 |
+| `auth.publicURL` | 空 | 改写后的令牌服务对外基准地址（如 `https://docker.example.com`）；留空按请求的 Host 与 `X-Forwarded-Proto` 推导，多域名部署推荐留空 |
+
+工作方式：上游对客户端凭证返回 401 挑战时，网关把挑战的 `realm` 改写指向自己的 `/token` 端点（`service`/`scope` 保留上游原值）转给客户端；docker 用登录凭证到网关 `/token` 换取**上游签发**的令牌后重试，网关把令牌原样转发给该上游。凭证与令牌只会发给对应分组的上游，不会发给第三方；带凭证的拉取不写共享缓存（私有内容不落盘）。
+
+```yaml
+auth:
+  passthrough: true
+  # publicURL: https://docker.example.com   # 网关在反代后拿不到真实 Host 时才需要
+
+groups:
+  - name: dockerhub
+    hosts: [docker.example.com]   # docker login docker.example.com 的凭证只发给本组上游
+    upstreams: [...]
+  - name: ghcr
+    hosts: [ghcr.example.com]     # ghcr.example.com 的凭证只发给本组上游
+    upstreams: [...]
+```
+
+客户端接入：`docker login docker.example.com`（网关不校验凭证、任意账号密码都登录成功，凭证在换上游令牌时才被使用），之后正常 pull；未登录的匿名拉取不受影响。
 | `search.sources` | `[hub, quay, mcr]` | 搜索哪些仓库 |
 | `search.timeout` | `8s` | 单次搜索总超时 |
 | `search.enrichUpdated` | `true` | 是否补查 Quay 的更新时间 |

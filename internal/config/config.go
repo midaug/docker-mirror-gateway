@@ -55,6 +55,7 @@ func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(),
 // Config 是 docker-mirror-gateway 的完整配置。
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
+	Auth      AuthConfig      `yaml:"auth"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Access    AccessConfig    `yaml:"access"`
 	Search    SearchConfig    `yaml:"search"`
@@ -209,6 +210,18 @@ type ServerConfig struct {
 	ReadHeaderTimeout Duration `yaml:"readHeaderTimeout"`
 	IdleTimeout       Duration `yaml:"idleTimeout"`
 	MaxManifestBytes  int64    `yaml:"maxManifestBytes"`
+}
+
+// AuthConfig 是客户端认证透传的配置。
+type AuthConfig struct {
+	// Passthrough 开启认证透传：客户端 docker login 后的凭证会被转发给上游，
+	// 用于访问私有镜像或提升匿名拉取配额。只对配置了 hosts（多域名模式）的
+	// 分组生效——单域名按路径区分分组时会把凭证发给错误的组，因此不透传。
+	// 默认 false（本地部署、个人使用无需开启）。
+	Passthrough bool `yaml:"passthrough"`
+	// PublicURL 是改写后的令牌服务对外基准地址（如 https://docker.example.com）。
+	// 留空按请求的 Host 与 X-Forwarded-Proto 推导；多域名部署推荐留空。
+	PublicURL string `yaml:"publicURL"`
 }
 
 type CacheConfig struct {
@@ -458,6 +471,11 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("MIRROR_GATEWAY_ADMIN_TOKEN"); v != "" {
 		c.Server.AdminToken = v
+	}
+	if v := os.Getenv("MIRROR_GATEWAY_AUTH_PASSTHROUGH"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Auth.Passthrough = b
+		}
 	}
 	if v := os.Getenv("MIRROR_GATEWAY_CACHE_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

@@ -135,7 +135,7 @@ func (s *Server) wrap(h http.HandlerFunc) http.Handler {
 // route 是单端口模式下的完整路由。
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case isV2Path(r.URL.Path) || isHealthPath(r.URL.Path):
+	case isV2Path(r.URL.Path) || isHealthPath(r.URL.Path) || isTokenPath(r.URL.Path):
 		s.servePull(w, r)
 	case isAdminPath(r.URL.Path):
 		s.serveAdmin(w, r)
@@ -151,11 +151,23 @@ func (s *Server) servePull(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleV2(w, r)
+	case isTokenPath(r.URL.Path):
+		// 令牌换取端点：认证透传模式下 docker 从改写的挑战里拿到这里，
+		// 受与 /v2 相同的访问控制（IP 白名单开启时同样受限）。
+		if !s.checkAccess(w, r) {
+			return
+		}
+		s.proxy.ServeToken(w, r)
 	case isHealthPath(r.URL.Path):
 		s.handleHealth(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// isTokenPath 报告是否为认证透传的令牌换取端点。
+func isTokenPath(path string) bool {
+	return path == "/token"
 }
 
 // checkAccess 在镜像拉取面执行 IP 白名单；健康检查不受限制，
