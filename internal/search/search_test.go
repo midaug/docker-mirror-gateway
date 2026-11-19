@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -611,5 +612,218 @@ func TestIsRollingTag(t *testing.T) {
 		if isRollingTag(tag) {
 			t.Errorf("isRollingTag(%q) 应为 false", tag)
 		}
+	}
+}
+
+// 错误分级：限流/鉴权走短冷却，5xx 走中等冷却，网络错误走长冷却。
+// 关键回归：一次偶发 403 不能把来源静默下线五分钟。
+func TestCooldownForErrorClass(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want time.Duration
+	}{
+		{"401", &statusError{code: http.StatusUnauthorized}, rateLimitCooldown},
+		{"403", &statusError{code: http.StatusForbidden}, rateLimitCooldown},
+		{"429", &statusError{code: http.StatusTooManyRequests}, rateLimitCooldown},
+		{"403 带响应体", &statusError{code: http.StatusForbidden, msg: "rate limit exceeded"}, rateLimitCooldown},
+		{"500", &statusError{code: http.StatusInternalServerError}, serverErrorCooldown},
+		{"503", &statusError{code: http.StatusServiceUnavailable}, serverErrorCooldown},
+		{"404 按默认", &statusError{code: http.StatusNotFound}, sourceCooldown},
+		{"网络错误", fmt.Errorf("dial tcp: timeout"), sourceCooldown},
+		{"包装后的 403", fmt.Errorf("fetch: %w", &statusError{code: http.StatusForbidden}), rateLimitCooldown},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := cooldownFor(c.err); got != c.want {
+				t.Errorf("cooldownFor = %v, 期望 %v", got, c.want)
+			}
+		})
+	}
+}
+
+// statusError 把上游响应片段带进错误信息，便于从日志判断 403/429 的原因。
+func TestStatusErrorMessageIncludesBody(t *testing.T) {
+	err := &statusError{code: http.StatusTooManyRequests, msg: "you have exceeded your rate limit"}
+	got := err.Error()
+	if !strings.Contains(got, "429") || !strings.Contains(got, "rate limit") {
+		t.Errorf("错误信息 = %q，应包含状态码与响应片段", got)
+	}
+}
+
+// markDown 后应按错误类型使用各自的冷却时长；短冷却到期后来源恢复可查。
+func TestCooldownUsesPerErrorDuration(t *testing.T) {
+	svc := New(nil, time.Second, []string{"hub"}, false, discardLogger())
+	svc.markDown("hub", &statusError{code: http.StatusForbidden})
+	if !svc.coolingDown("hub") {
+		t.Fatal("403 后应进入冷却")
+	}
+	if got := svc.downCool["hub"]; got != rateLimitCooldown {
+		t.Fatalf("403 冷却时长 = %v, 期望 %v", got, rateLimitCooldown)
+	}
+	// 把失败时间往前挪到刚好超过短冷却，模拟 30 秒后重试。
+	svc.mu.Lock()
+	svc.down["hub"] = time.Now().Add(-rateLimitCooldown - time.Second)
+	svc.mu.Unlock()
+	if svc.coolingDown("hub") {
+		t.Fatal("短冷却到期后不应再跳过该来源")
+	}
+}
+
+// 启用账号认证后：先换 token，Hub 搜索/标签请求都带上 Authorization。
+func TestHubAuthAttachesBearerToken(t *testing.T) {
+	oldLogin := hubLoginURL
+	t.Cleanup(func() { hubLoginURL = oldLogin })
+
+	var loginHits, searchAuthHits, tagAuthHits int
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		loginHits++
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("登录请求体解析失败: %v", err)
+		}
+		if body.Username != "alice" || body.Password != "pat-token" {
+			t.Errorf("登录凭据不对: %+v", body)
+		}
+		io.WriteString(w, `{"token":"jwt-token-abc"}`)
+	}))
+	defer login.Close()
+	hubLoginURL = login.URL + "/v2/users/login/"
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got == "Bearer jwt-token-abc" {
+			if strings.Contains(r.URL.Path, "/tags/") {
+				tagAuthHits++
+			} else {
+				searchAuthHits++
+			}
+		}
+		io.WriteString(w, `{"count":1,"results":[{"repo_name":"library/nginx","short_description":"x","star_count":1,"pull_count":1}]}`)
+	}))
+	defer hub.Close()
+	stubSources(t, hub, nil)
+
+	svc := New(nil, 3*time.Second, []string{"hub"}, false, discardLogger(),
+		WithHubClient(hub.Client()),
+		WithHubAuth("alice", "pat-token"),
+		WithTags(true),
+	)
+	// 标签接口在真实实现里指向 hubTagURL，stubSources 已一并改到 hub。
+	resp := svc.Search(context.Background(), "nginx", 5)
+	if len(resp.Results) != 1 || resp.Errors != nil {
+		t.Fatalf("搜索失败: results=%+v errors=%v", resp.Results, resp.Errors)
+	}
+	if loginHits != 1 {
+		t.Errorf("登录次数 = %d, 期望 1", loginHits)
+	}
+	if searchAuthHits != 1 {
+		t.Errorf("带 token 的搜索请求数 = %d, 期望 1", searchAuthHits)
+	}
+	if tagAuthHits < 1 {
+		t.Errorf("带 token 的标签请求数 = %d, 期望 >=1", tagAuthHits)
+	}
+}
+
+// token 在多次搜索间复用，不重复登录。
+func TestHubAuthTokenCached(t *testing.T) {
+	oldLogin := hubLoginURL
+	t.Cleanup(func() { hubLoginURL = oldLogin })
+
+	var loginHits int
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		loginHits++
+		io.WriteString(w, `{"token":"cached-token"}`)
+	}))
+	defer login.Close()
+	hubLoginURL = login.URL + "/v2/users/login/"
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"count":0,"results":[]}`)
+	}))
+	defer hub.Close()
+	stubSources(t, hub, nil)
+
+	svc := New(nil, 3*time.Second, []string{"hub"}, false, discardLogger(),
+		WithHubClient(hub.Client()), WithHubAuth("alice", "pat"))
+	for i := 0; i < 3; i++ {
+		svc.Search(context.Background(), "nginx", 5)
+	}
+	if loginHits != 1 {
+		t.Errorf("三次搜索后登录次数 = %d, 期望 1（token 应缓存）", loginHits)
+	}
+}
+
+// 换 token 失败时降级匿名：搜索照常发起、不报错。
+func TestHubAuthFailureFallsBackToAnonymous(t *testing.T) {
+	oldLogin := hubLoginURL
+	t.Cleanup(func() { hubLoginURL = oldLogin })
+
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"message":"bad credentials"}`)
+	}))
+	defer login.Close()
+	hubLoginURL = login.URL + "/v2/users/login/"
+
+	var authHeaders []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		io.WriteString(w, `{"count":1,"results":[{"repo_name":"library/nginx","short_description":"x","star_count":1,"pull_count":1}]}`)
+	}))
+	defer hub.Close()
+	stubSources(t, hub, nil)
+
+	svc := New(nil, 3*time.Second, []string{"hub"}, false, discardLogger(),
+		WithHubClient(hub.Client()), WithHubAuth("alice", "wrong"))
+	resp := svc.Search(context.Background(), "nginx", 5)
+	if len(resp.Results) != 1 || resp.Errors != nil {
+		t.Fatalf("认证失败不应影响搜索: results=%d errors=%v", len(resp.Results), resp.Errors)
+	}
+	for _, h := range authHeaders {
+		if h != "" {
+			t.Errorf("降级匿名后不应带 Authorization, got %q", h)
+		}
+	}
+}
+
+// Hub 用缓存的 token 被明确拒绝（401）时应清缓存重登录，
+// 而不是带着失效 token 继续请求最长 30 分钟。
+func TestHubAuthInvalidatesOnUnauthorized(t *testing.T) {
+	oldLogin := hubLoginURL
+	t.Cleanup(func() { hubLoginURL = oldLogin })
+
+	var loginHits int
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		loginHits++
+		io.WriteString(w, `{"token":"revoked-soon"}`)
+	}))
+	defer login.Close()
+	hubLoginURL = login.URL + "/v2/users/login/"
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"message":"token revoked"}`)
+	}))
+	defer hub.Close()
+	stubSources(t, hub, nil)
+
+	svc := New(nil, 3*time.Second, []string{"hub"}, false, discardLogger(),
+		WithHubClient(hub.Client()), WithHubAuth("alice", "pat"))
+
+	svc.Search(context.Background(), "nginx", 5) // 登录 1 次，hub 请求 401
+	if loginHits != 1 {
+		t.Fatalf("第一次搜索登录次数 = %d, 期望 1", loginHits)
+	}
+	// 手动把限流冷却拨到已过期，模拟 30 秒后的下一次搜索。
+	svc.mu.Lock()
+	svc.down["hub"] = time.Now().Add(-rateLimitCooldown - time.Second)
+	svc.mu.Unlock()
+
+	svc.Search(context.Background(), "nginx", 5) // token 已失效，应重新登录
+	if loginHits != 2 {
+		t.Errorf("第二次搜索登录次数 = %d, 期望 2（401 后应清缓存重登录）", loginHits)
 	}
 }

@@ -91,11 +91,17 @@ func run() error {
 	if cfg.Search.EnrichTags != nil {
 		enrichTags = *cfg.Search.EnrichTags
 	}
+	hubUser, hubPass := dockerHubSearchCredentials(cfg)
 	searchSvc := search.New(router.SearchClient(), cfg.Search.Timeout.D(), cfg.Search.Sources, enrichUpdated, logger.With("component", "search"),
 		// hub.docker.com 在境内通常只有走代理才通，单独用挂了代理的上游客户端。
 		search.WithHubClient(router.ProxiedSearchClient()),
+		// 复用 Docker Hub 账号提升搜索 API 限额（换 token 失败自动降级匿名）。
+		search.WithHubAuth(hubUser, hubPass),
 		search.WithTags(enrichTags),
 	)
+	if hubUser != "" {
+		logger.Info("Docker Hub 搜索将使用配置的账号认证")
+	}
 
 	api, err := server.New(server.Options{
 		Config:  cfg,
@@ -316,4 +322,24 @@ func newLogger(cfg config.LogConfig) *slog.Logger {
 		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(handler)
+}
+
+// dockerHubSearchCredentials 从 dockerhub 分组里挑一组可用于搜索 API 的账号。
+//
+// 只取 auth=config（默认）且填了 username 的官方源；passthrough 源用的是
+// 客户端凭证、没有配置账号，跳过。密码字段同时兼容密码与 PAT。
+// 找不到时返回空，搜索服务降级为匿名。
+func dockerHubSearchCredentials(cfg *config.Config) (string, string) {
+	for _, g := range cfg.Groups {
+		if g.Name != "dockerhub" && g.Name != "hub" {
+			continue
+		}
+		for _, u := range g.Upstreams {
+			if u.Passthrough() || strings.TrimSpace(u.Username) == "" {
+				continue
+			}
+			return u.Username, u.Password
+		}
+	}
+	return "", ""
 }

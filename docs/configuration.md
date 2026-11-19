@@ -193,6 +193,8 @@ groups:
 
 控制台的 Docker Hub 搜索会优先使用显式配了代理的上游，因为 `hub.docker.com` 在境内通常只有代理能访问；Quay、MCR 仍走默认直连。
 
+如果 Docker Hub 官方源（组名 `dockerhub` / `hub`）配了 `username` + `password`（密码或 PAT，且 `auth` 为默认的 `config`），搜索会自动用它换取 API token 并带上，享受认证用户的限流配额——匿名搜索按出口 IP 限流，共享代理出口容易返回 403。换 token 失败时自动降级为匿名，不影响搜索；`auth: passthrough` 的源没有配置账号，不参与。
+
 ## 内置加速源
 
 `config.yaml` 已预置一批境内公共加速源，开箱即用。数据取自 [status.anye.xyz](https://status.anye.xyz/) 的实时状态，加上本机实测吞吐，只保留在线且无需登录的公共源。

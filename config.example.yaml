@@ -128,8 +128,8 @@ groups:
         priority: 100
         # auth: passthrough     # 默认 config：用本源 username/password 认证；
                                 # passthrough 把客户端凭证原样发给该源，仅完全信任的官方源开启
-        # username: ""          # 填 Docker Hub 账号可提高配额（config 模式）
-        # password: ""
+        # username: ""          # Docker Hub 账号（密码或 PAT），同时提高拉取与搜索配额
+        # password: ""          # config 模式下生效；换 token 失败时搜索自动降级匿名
         # proxy: "http://127.0.0.1:7890"         # 单源代理；也支持 socks5h://、direct
         # proxyUsername: "user"                  # 代理认证，也可写进 URL
         # proxyPassword: "${PROXY_PASSWORD}"

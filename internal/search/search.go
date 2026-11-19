@@ -12,6 +12,7 @@ package search
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,9 +33,15 @@ const (
 	// sourceTimeout 是单个来源的超时。总超时往往给到 8 秒，
 	// 但一个来源慢不该让用户干等——先返回能拿到的结果。
 	sourceTimeout = 4 * time.Second
-	// sourceCooldown 是来源失败后的冷却时间。hub.docker.com 在部分网络下
+	// sourceCooldown 是来源失败后的默认冷却时间。hub.docker.com 在部分网络下
 	// 根本不通，冷却期内直接跳过，避免每次搜索都白等一轮超时。
 	sourceCooldown = 5 * time.Minute
+	// rateLimitCooldown 是 401/403/429 这类限流/鉴权响应的冷却时间。
+	// 这类响应说明来源可达、只是本次被拒，长冷却会让一个偶发 403
+	// 把来源"静默下线"五分钟，用户看到的就是"一直没有结果"。
+	rateLimitCooldown = 30 * time.Second
+	// serverErrorCooldown 是 5xx 的冷却时间，介于限流与彻底不通之间。
+	serverErrorCooldown = time.Minute
 	// enrichTimeout 是补查标签信息的预算。查不到就留空，
 	// 不能因为一个次要字段把搜索拖住。
 	enrichTimeout = 5 * time.Second
@@ -143,15 +150,19 @@ type Response struct {
 // Service 并发查询各个来源并合并结果。
 type Service struct {
 	client        *http.Client
-	hubClient     *http.Client // 可选：Docker Hub 专用客户端（通常挂在代理后面）
+	hubClient     *http.Client      // 可选：Docker Hub 专用客户端（通常挂在代理后面）
+	hubAuth       *hubTokenProvider // 可选：Docker Hub 账号认证（提升搜索 API 限额）
+	hubAuthUser   string            // 构造期暂存凭据，New 末尾转成 hubAuth
+	hubAuthPass   string
 	timeout       time.Duration
 	sources       []string
 	enrichUpdated bool
 	enrichTags    bool
 	log           *slog.Logger
 
-	mu   sync.Mutex
-	down map[string]time.Time // 来源 -> 最近一次失败的时间
+	mu       sync.Mutex
+	down     map[string]time.Time     // 来源 -> 失败冷却到期时间
+	downCool map[string]time.Duration // 来源 -> 本次实际冷却时长（用于日志/状态）
 
 	tagMu    sync.Mutex
 	tagCache map[string]tagInfo // 来源/仓库 -> 最新标签信息
@@ -193,6 +204,21 @@ func WithTags(enabled bool) Option {
 	}
 }
 
+// WithHubAuth 用 Docker Hub 账号（密码或 PAT）为搜索 API 启用认证。
+//
+// 匿名的 hub.docker.com 搜索接口按出口 IP 限流，共享代理出口很容易返回
+// 403/429；带上账号 token 可用认证用户的配额。换 token 失败时自动降级为
+// 匿名，不影响搜索。凭据为空时不启用。
+func WithHubAuth(username, password string) Option {
+	return func(s *Service) {
+		if strings.TrimSpace(username) == "" {
+			return
+		}
+		s.hubAuthUser = username
+		s.hubAuthPass = password
+	}
+}
+
 // New 创建搜索服务。client 为 nil 时使用默认客户端。
 func New(client *http.Client, timeout time.Duration, sources []string, enrichUpdated bool, log *slog.Logger, opts ...Option) *Service {
 	if client == nil {
@@ -214,10 +240,25 @@ func New(client *http.Client, timeout time.Duration, sources []string, enrichUpd
 		enrichUpdated: enrichUpdated,
 		log:           log,
 		down:          make(map[string]time.Time),
+		downCool:      make(map[string]time.Duration),
 		tagCache:      make(map[string]tagInfo),
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	// 有账号凭据时，用 Hub 客户端（含代理）换取 token，并把 Hub 请求
+	// 包一层自动附加 Authorization 的 transport。登录请求本身用裸客户端，
+	// 避免递归经过 auth transport。
+	if s.hubAuthUser != "" {
+		base := s.hubHTTPClient()
+		s.hubAuth = newHubTokenProvider(s.hubAuthUser, s.hubAuthPass, base, log)
+		transport := base.Transport
+		if transport == nil {
+			transport = http.DefaultTransport
+		}
+		wrapped := *base
+		wrapped.Transport = &hubAuthTransport{base: transport, provider: s.hubAuth}
+		s.hubClient = &wrapped
 	}
 	return s
 }
@@ -249,6 +290,12 @@ func (s *Service) Search(ctx context.Context, query string, limit int) Response 
 
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
+
+	// 用总 ctx 的预算换取 Hub token（若启用认证），失败会自行降级匿名。
+	// 放在并发查询之前，让登录时间不计入单个来源的 4 秒超时。
+	if s.hubAuth != nil {
+		s.hubAuth.refresh(ctx)
+	}
 
 	type outcome struct {
 		results []Result
@@ -296,6 +343,14 @@ func (s *Service) Search(ctx context.Context, query string, limit int) Response 
 			}
 			if err != nil {
 				s.markDown(src, err)
+				// Hub 用缓存的 token 被明确拒绝（401，如 PAT 被吊销）时
+				// 清掉缓存，下次搜索重新登录，而不是带着失效 token 空转。
+				if src == "hub" && s.hubAuth != nil {
+					var se *statusError
+					if errors.As(err, &se) && se.code == http.StatusUnauthorized {
+						s.hubAuth.invalidate()
+					}
+				}
 			} else {
 				s.markUp(src)
 			}
@@ -385,20 +440,40 @@ func truncateWithSourceFloor(results []Result, limit int) []Result {
 	return append(keep, extra...)
 }
 
+// cooldownFor 按错误类型决定冷却时长。
+//
+// 限流/鉴权（401/403/429）说明来源本身是通的、只是这次被拒，用长冷却会让
+// 一个偶发 403 把来源静默下线五分钟——用户看到的就是"一直没有结果"。
+// 5xx 介于两者之间；网络错误（超时、连接失败）才用默认的长冷却。
+func cooldownFor(err error) time.Duration {
+	var se *statusError
+	if errors.As(err, &se) {
+		switch {
+		case se.code == http.StatusUnauthorized || se.code == http.StatusForbidden || se.code == http.StatusTooManyRequests:
+			return rateLimitCooldown
+		case se.code >= 500 && se.code <= 599:
+			return serverErrorCooldown
+		}
+	}
+	return sourceCooldown
+}
+
 func (s *Service) coolingDown(src string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	at, ok := s.down[src]
-	return ok && time.Since(at) < sourceCooldown
+	return ok && time.Since(at) < s.downCool[src]
 }
 
 func (s *Service) markDown(src string, err error) {
+	cool := cooldownFor(err)
 	s.mu.Lock()
 	_, existed := s.down[src]
 	s.down[src] = time.Now()
+	s.downCool[src] = cool
 	s.mu.Unlock()
 	if !existed {
-		s.log.Warn("搜索来源不可用，暂时跳过", "source", src, "cooldown", sourceCooldown.String(), "error", err)
+		s.log.Warn("搜索来源不可用，暂时跳过", "source", src, "cooldown", cool.String(), "error", err)
 	}
 }
 
@@ -406,6 +481,7 @@ func (s *Service) markUp(src string) {
 	s.mu.Lock()
 	_, existed := s.down[src]
 	delete(s.down, src)
+	delete(s.downCool, src)
 	s.mu.Unlock()
 	if existed {
 		s.log.Info("搜索来源已恢复", "source", src)
@@ -1083,6 +1159,19 @@ func (s *Service) fetch(ctx context.Context, endpoint, accept string) ([]byte, e
 	return s.fetchWith(ctx, s.client, endpoint, accept)
 }
 
+// statusError 携带上游响应码，供冷却策略按错误类型分级。
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e *statusError) Error() string {
+	if e.msg != "" {
+		return fmt.Sprintf("上游返回 HTTP %d: %s", e.code, e.msg)
+	}
+	return fmt.Sprintf("上游返回 HTTP %d", e.code)
+}
+
 // fetchWith 用指定客户端发起 GET 并限制响应体积。
 func (s *Service) fetchWith(ctx context.Context, client *http.Client, endpoint, accept string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -1097,8 +1186,10 @@ func (s *Service) fetchWith(ctx context.Context, client *http.Client, endpoint, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-		return nil, fmt.Errorf("上游返回 HTTP %d", resp.StatusCode)
+		// 读一点响应体：403/429 通常带限流说明（如 Docker Hub 的 rate limit），
+		// 写进错误里才能在日志/接口上一眼看出原因，而不是只看到裸状态码。
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, &statusError{code: resp.StatusCode, msg: strings.TrimSpace(string(body))}
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 }
