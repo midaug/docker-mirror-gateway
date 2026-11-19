@@ -27,7 +27,7 @@ Docker / containerd ──▶ Docker Mirror Gateway ──┬──▶ dockerhub
 | 官方源必须挂代理才可用，但代理又慢又不能拖累整体 | **源级代理**：官方源单独配 socks5/http 代理作兜底，加速源直连主力，健康探测与拉取走同一代理不出现「探测通过拉不动」 |
 | CI 反复拉同一批镜像，回源带宽白白浪费 | **pull-through 缓存**（默认关闭）：本地磁盘或 S3，blob 边传边校验 sha256，digest 永久缓存 |
 | 源挂了没人知道，出问题只能翻日志 | **监控通知**：分组健康跌破阈值时经模板化 webhook（GET/POST，协议无关，飞书/企微/自建服务都能适配）或邮件告警，恢复自动通知；控制台实时展示每条拉取与每个上游 |
-| Nexus / Harbor 太重，只想给拉镜像提速 | **单二进制 17MB**，直接依赖只有 2 个（yaml、minio-go），不依赖数据库、Redis 或 JVM，`docker compose up` 一键起 |
+| Nexus / Harbor 太重，只想给拉镜像提速 | **单二进制约 12 MB**（Releases 压缩包 4~5 MB），直接依赖只有 2 个（yaml、minio-go），不依赖数据库、Redis 或 JVM，空载 CPU 0.15%、内存约 20 MB，`docker compose up` 一键起 |
 
 一句话：**它不是又一个加速地址，而是把「选哪个地址」这件事自动化了。**
 
@@ -41,8 +41,19 @@ Docker / containerd ──▶ Docker Mirror Gateway ──┬──▶ dockerhub
 - **源级代理** — 每个上游可单独配置 http/socks5 代理（含认证）或强制直连。
 - **控制台** — 镜像搜索（含版本号过滤与跳转源页面）、拉取监控、上游与路由状态。
 - **安全** — 拉取与管理端口分离、IP 白名单、adminToken、认证透传（Bearer / Basic）。
+- **轻量** — 单二进制约 12 MB（压缩包 4~5 MB），空载 CPU 不到 1%、内存约 20 MB，树莓派也能长期跑。
 
 更多配置细节见[配置参考](docs/configuration.md)与[运行与运维](docs/operations.md)。
+
+## 资源占用
+
+Go 编译的静态单二进制，无 JVM、无数据库进程；转发大文件走流式零缓冲，内存不随镜像体积增长。日常运行的实测数据（`docker stats`）：
+
+![docker stats 实测资源占用](docs/stats.png)
+
+- **CPU 0.15%** — 空载时几乎只有健康探测的开销，且最近有真实拉取的源会跳过探测
+- **内存 19.5 MiB** — 并发转发多个大镜像层也稳定在这个量级
+- **PIDS 8** — 常驻线程/协程极少，小规格 VPS、NAS、树莓派都放得下
 
 ## 快速开始
 
