@@ -21,6 +21,32 @@ import (
 // errNotFound 表示当前上游没有这个镜像（不代表上游故障）。
 var errNotFound = errors.New("上游不存在该对象")
 
+// deniedError 表示上游按仓库白名单/权限策略拒绝了整个仓库（如 DaoCloud
+// public-image-mirror 对白名单外镜像的 403 DENIED）。
+//
+// 它与源故障的区别：源本身在线且能正常服务白名单内的镜像（健康探测用的
+// 常用镜像通常就在白名单内），只是不提供这一个仓库。因此它不应该计入
+// 健康降级统计，否则源会在可用/不可用之间反复震荡。
+type deniedError struct {
+	msg string
+}
+
+func (e *deniedError) Error() string { return e.msg }
+
+// isDenylistBody 判断上游 403 响应体是否为白名单拒绝。
+// 已知来源的响应特征：
+//   - DaoCloud: {"errors":[{"code":"DENIED","message":"…这镜像不在白名单.
+//     this image is not in the allowlist."}]}
+func isDenylistBody(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	low := strings.ToLower(string(body))
+	return strings.Contains(low, "denied") ||
+		strings.Contains(low, "allowlist") ||
+		strings.Contains(low, "白名单")
+}
+
 // Options 是 Proxy 的行为参数。
 type Options struct {
 	MaxManifestBytes int64
@@ -129,6 +155,7 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 	var (
 		lastErr   error
 		notFound  int
+		denied    int
 		attempted int
 	)
 	cands, prefetched := route.Group.Pool.CandidatesForManifest(ctx, name, ref, accept)
@@ -168,19 +195,39 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 		if errors.Is(err, errNotFound) {
 			notFound++
 			u.ReportSuccess(time.Since(start))
+			act.SetUpstream(u.Name)
 			continue
 		}
 		if ctx.Err() != nil {
 			return
+		}
+		// 失败也归因到具体上游（多次失败时保留最后一个，与返回给客户端
+		// 的错误一致），否则控制台里失败记录的「上游」列是空的。
+		act.SetUpstream(u.Name)
+		var deniedErr *deniedError
+		if errors.As(err, &deniedErr) {
+			// 白名单/权限策略拒绝是该源对整个仓库的策略，不是源故障：
+			// 不计入健康降级，否则探测镜像（常在白名单内）会让源在
+			// 可用/不可用之间反复震荡。
+			denied++
+			lastErr = err
+			continue
 		}
 		lastErr = err
 		u.ReportFailure(err)
 		p.log.Warn("从上游获取 manifest 失败", "group", route.Group.Name, "upstream", u.Name, "repo", name, "ref", ref, "error", err)
 	}
 
-	if notFound > 0 && notFound == attempted {
-		act.Fail(errors.New("镜像不存在"))
-		writeRegistryError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", "镜像不存在", map[string]string{"name": name, "reference": ref})
+	// 健康源一致 404（连同白名单拒绝的兜底源）时按 404 语义返回。
+	// 典型场景：docker 拉取 OCI attestation manifest（platform=unknown），
+	// 多数镜像站没有同步它，若返回 502 + 兜底源的 403，整个 pull 会中断。
+	if notFound > 0 && notFound+denied == attempted {
+		msg := "镜像不存在"
+		if denied > 0 {
+			msg = fmt.Sprintf("各镜像源均未提供此镜像（%d 个源因白名单策略拒绝提供）", denied)
+		}
+		act.Fail(errors.New(msg))
+		writeRegistryError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", msg, map[string]string{"name": name, "reference": ref})
 		return
 	}
 	act.Fail(lastErr)
@@ -212,6 +259,11 @@ func (p *Proxy) fetchManifest(ctx context.Context, u *Upstream, name, ref, accep
 		return nil, errNotFound
 	case http.StatusUnauthorized, http.StatusForbidden:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		if resp.StatusCode == http.StatusForbidden && isDenylistBody(body) {
+			// DaoCloud public-image-mirror 等按仓库白名单放行的源：
+			// 对不在白名单的仓库一律 403 DENIED，是仓库级策略而非源故障。
+			return nil, &deniedError{msg: fmt.Sprintf("%s 拒绝访问(%d): %s", u.Name, resp.StatusCode, snippet(body))}
+		}
 		return nil, fmt.Errorf("%s 拒绝访问(%d): %s", u.Name, resp.StatusCode, snippet(body))
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
@@ -423,6 +475,7 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 	var (
 		lastErr   error
 		notFound  int
+		denied    int
 		attempted int
 	)
 
@@ -443,6 +496,7 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 				return // 客户端已断开，这不是上游的错，不计失败
 			}
 			lastErr = err
+			act.SetUpstream(u.Name)
 			u.ReportFailure(err)
 			continue
 		}
@@ -466,11 +520,21 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 			resp.Body.Close()
 			notFound++
 			u.ReportSuccess(time.Since(start))
+			act.SetUpstream(u.Name)
 			continue
 		default:
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 			resp.Body.Close()
+			if resp.StatusCode == http.StatusForbidden && isDenylistBody(body) {
+				// 白名单拒绝是仓库级策略而非源故障：不降级健康度，
+				// 但照常归因并继续尝试下一个源。
+				denied++
+				lastErr = &deniedError{msg: fmt.Sprintf("%s 拒绝访问(%d): %s", u.Name, resp.StatusCode, snippet(body))}
+				act.SetUpstream(u.Name)
+				continue
+			}
 			lastErr = fmt.Errorf("%s 返回 %d: %s", u.Name, resp.StatusCode, snippet(body))
+			act.SetUpstream(u.Name)
 			if isUpstreamFault(resp.StatusCode) {
 				u.ReportFailure(lastErr)
 			}
@@ -533,9 +597,13 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 		return
 	}
 
-	if notFound > 0 && notFound == attempted {
-		act.Fail(errors.New("blob 不存在"))
-		writeRegistryError(w, http.StatusNotFound, "BLOB_UNKNOWN", "blob 不存在", map[string]string{"digest": digest})
+	if notFound > 0 && notFound+denied == attempted {
+		msg := "blob 不存在"
+		if denied > 0 {
+			msg = fmt.Sprintf("各镜像源均未提供此 blob（%d 个源因白名单策略拒绝提供）", denied)
+		}
+		act.Fail(errors.New(msg))
+		writeRegistryError(w, http.StatusNotFound, "BLOB_UNKNOWN", msg, map[string]string{"digest": digest})
 		return
 	}
 	act.Fail(lastErr)

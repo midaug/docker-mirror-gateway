@@ -10,8 +10,7 @@ import (
 func TestSnapshotConcurrentWithSetGroup(t *testing.T) {
 	tr := New(10)
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		i := i
+	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -22,9 +21,6 @@ func TestSnapshotConcurrentWithSetGroup(t *testing.T) {
 			e.AddBytes(50)
 			e.Finish()
 			_ = tr.List(0)
-			if i < 0 {
-				t.Fatal("unreachable")
-			}
 		}()
 	}
 	wg.Wait()

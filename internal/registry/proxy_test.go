@@ -35,15 +35,17 @@ type fakeManifest struct {
 // fakeRegistry 模拟一个带 token 认证的 Docker Registry。
 type fakeRegistry struct {
 	*httptest.Server
-	t            *testing.T
-	token        string
-	manifests    map[string]fakeManifest
-	blobs        map[string][]byte
-	fail         bool
-	manifestReqs atomic.Int64
-	blobReqs     atomic.Int64
-	tagsReqs     atomic.Int64
-	seen         atomic.Value
+	t              *testing.T
+	token          string
+	manifests      map[string]fakeManifest
+	blobs          map[string][]byte
+	fail           bool
+	deny           map[string]bool // 这些仓库返回 403 DENIED 白名单响应
+	plainForbidden map[string]bool // 这些仓库返回无特征的 403
+	manifestReqs   atomic.Int64
+	blobReqs       atomic.Int64
+	tagsReqs       atomic.Int64
+	seen           atomic.Value
 }
 
 func newFakeRegistry(t *testing.T) *fakeRegistry {
@@ -85,6 +87,17 @@ func (f *fakeRegistry) handle(w http.ResponseWriter, r *http.Request) {
 	f.seen.Store(r.URL.Path)
 
 	kind, name, ref := ParseV2Path(strings.TrimPrefix(r.URL.Path, "/v2/"))
+	if f.deny[name] {
+		// 模拟 DaoCloud public-image-mirror 的白名单拒绝
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"errors":[{"code":"DENIED","message":"这镜像不在白名单. this image is not in the allowlist."}]}`)
+		return
+	}
+	if f.plainForbidden[name] {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
 	switch kind {
 	case PathManifest:
 		f.manifestReqs.Add(1)
@@ -445,5 +458,120 @@ func TestProxyRecordsActivity(t *testing.T) {
 	sum2 := p.Activity().Summary()
 	if sum2.Total != 4 || sum2.Cached != 2 {
 		t.Errorf("汇总 = %+v", sum2)
+	}
+}
+
+// 拉取带 attestation 的镜像时，健康源可能一致 404（镜像站未同步
+// platform=unknown 的 attestation manifest），白名单源（如 DaoCloud）
+// 兜底返回 403 DENIED。此时应按 404 语义返回，而不是把兜底源的 403
+// 包成 502 中断整个 pull；且白名单拒绝是仓库级策略，不能降级源健康度。
+func TestProxyManifestDenylistFallback(t *testing.T) {
+	ok := newFakeRegistry(t) // 该仓库存在但请求的 manifest 不存在 → 404
+	// 占位 manifest 保证 registry 本身可用，但 digest 与请求的不同
+	ok.addManifest("library/nginx", "latest", MediaTypeDockerManifest,
+		[]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{}}`))
+	deny := newFakeRegistry(t)
+	deny.deny = map[string]bool{"library/nginx": true}
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "ok", URL: ok.URL, Priority: 10},
+		{Name: "deny", URL: deny.URL, Priority: 20},
+	}, c)
+
+	missing := "sha256:" + strings.Repeat("ab", 32)
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/"+missing, nil), "library/nginx", missing)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d, 期望 404（而非兜底源 403 的 502）, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "MANIFEST_UNKNOWN") {
+		t.Errorf("错误码不符合 Registry 规范: %s", rec.Body.String())
+	}
+
+	// 失败记录应归因到最后一个被尝试的上游（deny），而不是空白
+	items := p.Activity().List(0)
+	if len(items) == 0 || items[0].State != activity.StateFailed {
+		t.Fatalf("活动记录 = %+v", items)
+	}
+	if items[0].Upstream != "deny" {
+		t.Errorf("失败记录上游 = %q, 期望 deny", items[0].Upstream)
+	}
+
+	// 白名单 403 不计入健康降级：deny 源应保持健康
+	router := p.router
+	var pool *Pool
+	for _, g := range router.Groups() {
+		if g.Name == "test" {
+			pool = g.Pool
+		}
+	}
+	if pool == nil {
+		t.Fatal("找不到 test 分组")
+	}
+	for _, u := range pool.Upstreams() {
+		if u.Name == "deny" && !u.Healthy() {
+			t.Errorf("白名单 403 不应降级 deny 源健康度")
+		}
+	}
+}
+
+// 无白名单特征的 403（真实权限问题）仍然计入健康降级。
+func TestProxyManifestPlainForbiddenDegrades(t *testing.T) {
+	f := newFakeRegistry(t)
+	f.plainForbidden = map[string]bool{"library/nginx": true}
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "fake", URL: f.URL, Priority: 10},
+	}, c)
+
+	for i := 0; i < 3; i++ { // failThreshold = 3
+		rec := httptest.NewRecorder()
+		p.ServeManifest(rec, httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil), "library/nginx", "latest")
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("第 %d 次状态码 = %d, 期望 502", i+1, rec.Code)
+		}
+	}
+
+	router := p.router
+	for _, g := range router.Groups() {
+		if g.Name == "test" {
+			for _, u := range g.Pool.Upstreams() {
+				if u.Name == "fake" && u.Healthy() {
+					t.Errorf("无特征的 403 连续 %d 次后应降级健康度", 3)
+				}
+			}
+		}
+	}
+}
+
+// blob 路径同样：健康源 404 + 白名单源 403 → 404 BLOB_UNKNOWN。
+func TestProxyBlobDenylistFallback(t *testing.T) {
+	ok := newFakeRegistry(t)
+	deny := newFakeRegistry(t)
+	deny.deny = map[string]bool{"library/nginx": true}
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "ok", URL: ok.URL, Priority: 10},
+		{Name: "deny", URL: deny.URL, Priority: 20},
+	}, c)
+
+	missing := "sha256:" + strings.Repeat("cd", 32)
+	rec := httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/nginx/blobs/"+missing, nil), "library/nginx", missing)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d, 期望 404, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "BLOB_UNKNOWN") {
+		t.Errorf("错误码不符合 Registry 规范: %s", rec.Body.String())
+	}
+
+	items := p.Activity().List(0)
+	if len(items) == 0 || items[0].Upstream != "deny" {
+		t.Errorf("失败记录上游 = %+v, 期望 deny", items)
 	}
 }
