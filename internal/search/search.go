@@ -573,6 +573,10 @@ func (s *Service) enrichResults(ctx context.Context, results []Result, tagFilter
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
+				// 预算耗尽还没轮到验证，不能让未过滤的结果混出去。
+				if tagFilter != "" {
+					results[i] = Result{}
+				}
 				return
 			}
 			defer func() { <-sem }()

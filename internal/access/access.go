@@ -103,11 +103,15 @@ func (c *Control) Allowed(r *http.Request) (bool, string) {
 //
 // 默认只看 TCP 对端地址：X-Forwarded-For 可以被任意客户端伪造，
 // 只有明确配置了 trustForwardedFor 时才会采信。
+// 采信时取链尾（最后一个条目）——它由最靠近网关的可信代理追加，
+// 客户端无法伪造；首个条目是客户端自己带的，反代只是追加，
+// 采信首个值等于允许客户端伪造白名单内的源地址。
 func (c *Control) ClientIP(r *http.Request) netip.Addr {
 	if c != nil && c.trustForwarded {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first := strings.TrimSpace(strings.Split(xff, ",")[0])
-			if a, err := netip.ParseAddr(first); err == nil {
+			parts := strings.Split(xff, ",")
+			last := strings.TrimSpace(parts[len(parts)-1])
+			if a, err := netip.ParseAddr(last); err == nil {
 				return a.Unmap()
 			}
 		}

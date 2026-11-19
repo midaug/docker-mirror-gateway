@@ -109,12 +109,29 @@ func TestForwardedForTrusted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, ip := c.Allowed(newReq("127.0.0.1:1000", map[string]string{"X-Forwarded-For": "10.1.1.1, 172.16.0.1"}))
+	// 反代追加真实客户端 IP 在链尾，应取最后一个条目。
+	ok, ip := c.Allowed(newReq("127.0.0.1:1000", map[string]string{"X-Forwarded-For": "203.0.113.9, 10.1.1.1"}))
 	if !ok {
-		t.Error("开启信任后应使用 X-Forwarded-For 的第一个地址")
+		t.Error("开启信任后应使用 X-Forwarded-For 的链尾地址")
 	}
 	if ip != "10.1.1.1" {
-		t.Errorf("ip = %q, 期望 10.1.1.1", ip)
+		t.Errorf("ip = %q, 期望链尾 10.1.1.1", ip)
+	}
+}
+
+func TestForwardedForSpoofRejected(t *testing.T) {
+	c, err := New([]string{"10.0.0.0/8"}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 客户端伪造白名单内的地址放在首位、反代把真实 IP 追加在链尾：
+	// 取首个值会被绕过，取链尾才能拿到真实来源。
+	ok, ip := c.Allowed(newReq("203.0.113.7:1000", map[string]string{"X-Forwarded-For": "10.0.0.5, 203.0.113.7"}))
+	if ok {
+		t.Error("伪造的链首地址不应被采信")
+	}
+	if ip != "203.0.113.7" {
+		t.Errorf("ip = %q, 期望反代追加的真实地址 203.0.113.7", ip)
 	}
 }
 

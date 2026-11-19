@@ -94,7 +94,7 @@ data:
 | `groups[].notify.minHealthy` | `0` | 健康源少于该数量时告警；0 = 不通知 |
 | `access.allow` | 空 | 允许拉取的 IP / CIDR；空表示不限制 |
 | `access.deny` | 空 | 明确拒绝的来源，优先于 `allow` |
-| `access.trustForwardedFor` | `false` | 是否采信 `X-Forwarded-For` |
+| `access.trustForwardedFor` | `false` | 是否采信 `X-Forwarded-For`（取链尾地址，即反代追加的真实客户端 IP） |
 | `search.enabled` | `true` | 控制台镜像搜索 |
 
 | `search.sources` | `[hub, quay, mcr]` | 搜索哪些仓库 |

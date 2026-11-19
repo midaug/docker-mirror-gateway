@@ -39,7 +39,7 @@ cache:
 access:
   allow: []
   deny: []
-  trustForwardedFor: false      # 仅反代后开启，否则客户端可伪造 X-Forwarded-For
+  trustForwardedFor: false      # 仅反代后开启；取 XFF 链尾（反代追加的真实 IP），防伪造
 
 # 控制台镜像搜索（查各仓库公开接口；GHCR/GCR 等无匿名搜索接口，不支持）
 search:

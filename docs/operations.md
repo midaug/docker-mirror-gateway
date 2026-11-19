@@ -145,7 +145,7 @@ access:
 - 支持单 IP 与 CIDR，IPv4 / IPv6；`allow` 为空表示只按 `deny` 拦。
 - `deny` 优先；被拒时返回 403 与 registry 规范的错误体。
 - 只作用于拉取端口，`/healthz`、`/readyz` 不受限制。
-- `trustForwardedFor` 默认关闭：`X-Forwarded-For` 可伪造，只有前面确实挂了反向代理时才开。
+- `trustForwardedFor` 默认关闭：`X-Forwarded-For` 可伪造，只有前面确实挂了反向代理时才开。开启后取链尾地址（最靠近网关的可信代理追加的真实客户端 IP），客户端伪造的链首值不生效。
 
 ## 控制台
 

@@ -84,6 +84,10 @@ type S3Store struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+
+	// enqMu/stopping 保证 Close 的 wg.Wait 不会与新上传的 wg.Add 竞争。
+	enqMu    sync.Mutex
+	stopping bool
 }
 
 // NewS3 创建 S3 缓存后端，并确保 bucket 可用。
@@ -183,6 +187,9 @@ func (s *S3Store) TagTTL() time.Duration { return s.tagTTL }
 
 // Close 停止后台任务并等待在途上传收尾（最多 10 秒）。
 func (s *S3Store) Close() error {
+	s.enqMu.Lock()
+	s.stopping = true
+	s.enqMu.Unlock()
 	s.cancel()
 	done := make(chan struct{})
 	go func() {
@@ -444,8 +451,17 @@ func (w *s3Writer) Abort() {
 }
 
 // enqueueUpload 在后台完成上传，最多 4 个并发。
+// 与 Close 互斥：WaitGroup 的 Add 不允许在 Wait 已开始后进行，
+// 关停后到达的提交直接丢弃临时文件。
 func (s *S3Store) enqueueUpload(tmpPath, digest string, size int64) {
+	s.enqMu.Lock()
+	if s.stopping {
+		s.enqMu.Unlock()
+		os.Remove(tmpPath)
+		return
+	}
 	s.wg.Add(1)
+	s.enqMu.Unlock()
 	go func() {
 		defer s.wg.Done()
 		select {
@@ -604,7 +620,12 @@ func (s *S3Store) Purge() error {
 			return fmt.Errorf("删除 S3 对象失败: %w", err.Err)
 		}
 	}
-	s.lastUse = sync.Map{} // 清空访问时间表，避免旧条目无限累积
+	// 逐条清空访问时间表，避免旧条目无限累积；整体重赋值会与并发的
+	// TouchBlob/Load 产生数据竞争。
+	s.lastUse.Range(func(key, _ any) bool {
+		s.lastUse.Delete(key)
+		return true
+	})
 	s.size.Store(0)
 	s.objects.Store(0)
 	return nil

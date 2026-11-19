@@ -816,7 +816,31 @@ function pullCommand(item) {
   const alias = grp && (grp.aliases || [])[0];
   const usePrefix = alias && !(grp && grp.default);
   const prefix = usePrefix ? '/' + alias : '';
-  return `docker pull ${origin}${prefix}/${item.name}:latest`;
+  // docker pull 的参数只有 host[:port]/path，不能带协议前缀。
+  const host = origin.replace(/^https?:\/\//, '');
+  return `docker pull ${host}${prefix}/${item.name}:latest`;
+}
+
+// copyText 把文本写入剪贴板。navigator.clipboard 仅在安全上下文
+// （HTTPS / localhost）可用，HTTP 内网访问时退回 execCommand 方案。
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    ok ? resolve() : reject(new Error('execCommand copy failed'));
+  });
 }
 
 // versionParts 把 1.27.3-alpine 解析成 [1,27,3]；不是版本号返回 null。
@@ -899,9 +923,10 @@ function renderSearch(data) {
   const errors = searchErrors.length
     ? `<div style="padding:10px 18px;color:var(--muted);font-size:12px">部分来源不可用：${esc(searchErrors.join('；'))}</div>`
     : '';
-  box.innerHTML = `<div style="overflow-x:auto"><table><thead><tr>
+  // 错误提示放表格上方：某来源整体失败（如 hub 代理不可用）时一眼可见。
+  box.innerHTML = `${errors}<div style="overflow-x:auto"><table><thead><tr>
       ${sortHeader('name', '镜像')}<th>描述</th>${sortHeader('source', '来源')}${sortHeader('stars', 'Star', 'num')}${sortHeader('pulls', '拉取量', 'num')}${sortHeader('latestTag', '最新版本')}${sortHeader('updated', '更新时间', 'num')}<th></th>
-    </tr></thead><tbody>${rows}</tbody></table></div>${errors}`;
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
   box.querySelectorAll('th[data-sort]').forEach((th) => {
     th.addEventListener('click', () => {
       const key = th.dataset.sort;
@@ -918,7 +943,7 @@ function renderSearch(data) {
     btn.addEventListener('click', async () => {
       const cmd = pullCommand(searchView[Number(btn.dataset.copy)]);
       try {
-        await navigator.clipboard.writeText(cmd);
+        await copyText(cmd);
         btn.textContent = '已复制';
         setTimeout(() => { btn.textContent = '复制命令'; }, 1500);
       } catch (e) {

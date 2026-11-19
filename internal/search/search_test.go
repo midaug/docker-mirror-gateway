@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -518,7 +519,8 @@ func TestSortTagsByVersion(t *testing.T) {
 
 // 带 tag 搜索时只保留确实拥有该标签的仓库。
 func TestSearchFiltersByTag(t *testing.T) {
-	var tagHits int
+	// 并发 handler 都会自增，必须用原子类型（-race 会检出普通 int 的竞态）。
+	var tagHits atomic.Int64
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/v2/search/repositories/"):
@@ -530,14 +532,14 @@ func TestSearchFiltersByTag(t *testing.T) {
 				{"repo_name":"other/nginx","short_description":"Fork","star_count":1,"pull_count":2}
 			]}`)
 		case strings.HasPrefix(r.URL.Path, "/v2/repositories/library/nginx/tags/"):
-			tagHits++
+			tagHits.Add(1)
 			io.WriteString(w, `{"results":[
 				{"name":"latest","last_updated":"2026-11-13T13:52:24Z"},
 				{"name":"1.31.8-alpine3.24","last_updated":"2026-11-13T13:52:24Z"},
 				{"name":"1.31.8","last_updated":"2026-11-12T09:00:00Z"}
 			]}`)
 		case strings.HasPrefix(r.URL.Path, "/v2/repositories/other/nginx/tags/"):
-			tagHits++
+			tagHits.Add(1)
 			io.WriteString(w, `{"results":[{"name":"latest","last_updated":"2026-11-13T13:52:24Z"},{"name":"0.9"}]}`)
 		default:
 			http.NotFound(w, r)
@@ -564,8 +566,8 @@ func TestSearchFiltersByTag(t *testing.T) {
 	if len(r.RecentTags) != 2 || r.RecentTags[0] != "1.31.8-alpine3.24" {
 		t.Errorf("RecentTags = %v", r.RecentTags)
 	}
-	if tagHits != 2 {
-		t.Errorf("标签接口应调用 2 次（每个候选仓库各一次）, 实际 %d", tagHits)
+	if got := tagHits.Load(); got != 2 {
+		t.Errorf("标签接口应调用 2 次（每个候选仓库各一次）, 实际 %d", got)
 	}
 }
 
