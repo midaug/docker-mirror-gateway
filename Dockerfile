@@ -29,7 +29,9 @@ COPY --from=builder /out/docker-mirror-gateway /usr/local/bin/docker-mirror-gate
 
 USER mirror
 WORKDIR /var/lib/docker-mirror-gateway
-ENV MIRROR_GATEWAY_CACHE_DIR=/var/lib/docker-mirror-gateway/cache
+# 统一数据目录：镜像运行默认持久化拉取记录；不想要时用环境变量关掉。
+ENV MIRROR_GATEWAY_DATA_DIR=/var/lib/docker-mirror-gateway \
+    MIRROR_GATEWAY_DATA_PERSIST=true
 
 # 8080 镜像拉取，8081 管理后台
 EXPOSE 8080 8081

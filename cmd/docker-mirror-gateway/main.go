@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/midaug/docker-mirror-gateway/internal/activity"
 	"github.com/midaug/docker-mirror-gateway/internal/cache"
 	"github.com/midaug/docker-mirror-gateway/internal/config"
 	"github.com/midaug/docker-mirror-gateway/internal/metrics"
@@ -58,6 +60,20 @@ func run() error {
 	}
 	defer c.Close()
 
+	// 拉取记录持久化：默认关闭，本地直接运行不会在磁盘留下数据文件；
+	// 服务器部署开启后写入统一数据目录，重启仍可查看历史。
+	var tracker *activity.Tracker
+	if cfg.Data.Persist {
+		dataDir, err := cfg.DataDir()
+		if err != nil {
+			return fmt.Errorf("解析数据目录失败: %w", err)
+		}
+		path := filepath.Join(dataDir, "activity.json")
+		tracker = activity.NewPersistent(activity.DefaultStoreLimit, path, logger.With("component", "activity"))
+		defer tracker.Close()
+		logger.Info("拉取记录持久化已启用", "path", path, "limit", activity.DefaultStoreLimit)
+	}
+
 	m := metrics.New()
 	router, err := registry.NewRouter(cfg, logger.With("component", "router"), m)
 	if err != nil {
@@ -65,6 +81,7 @@ func run() error {
 	}
 	proxy := registry.NewProxy(router, c, registry.Options{
 		MaxManifestBytes: cfg.Server.MaxManifestBytes,
+		Activity:         tracker,
 	}, logger.With("component", "proxy"), m)
 	enrichUpdated := true
 	if cfg.Search.EnrichUpdated != nil {
@@ -117,6 +134,9 @@ func run() error {
 		logger.Info("已加载配置文件", "path", cfg.Path)
 	} else {
 		logger.Info("未找到配置文件，使用内置默认配置")
+	}
+	if dataDir, err := cfg.DataDir(); err == nil {
+		logger.Info("数据目录", "dir", dataDir, "persist", cfg.Data.Persist)
 	}
 	adminAddr := cfg.Server.AdminAddr
 	if adminAddr == "" {

@@ -9,6 +9,7 @@ package activity
 
 import (
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,8 +32,12 @@ const (
 	StateFailed = "failed" // 失败或中断
 )
 
-// DefaultLimit 是列表默认保留的条数。
+// DefaultLimit 是页面默认展示的条数。
 const DefaultLimit = 100
+
+// DefaultStoreLimit 是持久化文件默认保留的条数。
+// 比页面展示上限大，重启后可以回溯更久的历史。
+const DefaultStoreLimit = 1000
 
 // minSpeedWindow / minSpeedBytes 是计算速度的下限。低于这个量级的样本
 // （几 KB 的镜像配置层、几十毫秒的小清单）算出来的数字没有参考价值，
@@ -82,6 +87,10 @@ type Entry struct {
 	errMsg     string
 	endedAt    time.Time
 	transferAt time.Time
+
+	// onDone 在记录进入终态时回调一次，用于触发持久化写盘。
+	// 由 Tracker 注入，nil 表示不需要。
+	onDone func()
 }
 
 // Tracker 维护最近 N 条记录。零值不可用，请用 New。
@@ -90,6 +99,15 @@ type Tracker struct {
 	entries []*Entry
 	limit   int
 	nextID  uint64
+
+	// 以下字段仅在持久化模式（NewPersistent）下使用。
+	storePath string
+	log       *slog.Logger
+	dirty     chan struct{}
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // New 创建记录器。limit <= 0 时使用 DefaultLimit。
@@ -112,6 +130,9 @@ func (t *Tracker) Begin(kind, repo, ref, group string) *Entry {
 		group:     group,
 		state:     StateActive,
 		startedAt: time.Now(),
+	}
+	if t.dirty != nil {
+		e.onDone = t.signalDirty
 	}
 	t.mu.Lock()
 	t.nextID++
@@ -268,6 +289,7 @@ func (e *Entry) Finish() {
 	}
 	e.state = StateDone
 	e.endedAt = time.Now()
+	e.notifyDoneLocked()
 }
 
 // FinishCached 标记为命中缓存。
@@ -283,6 +305,7 @@ func (e *Entry) FinishCached() {
 	e.state = StateCached
 	e.cache = "hit"
 	e.endedAt = time.Now()
+	e.notifyDoneLocked()
 }
 
 // Fail 标记失败。已结束的记录不会被覆盖。
@@ -299,6 +322,17 @@ func (e *Entry) Fail(err error) {
 	e.endedAt = time.Now()
 	if err != nil {
 		e.errMsg = err.Error()
+	}
+	e.notifyDoneLocked()
+}
+
+// notifyDoneLocked 在持锁状态下触发一次终态回调后清空。
+// 回调只做非阻塞信号通知，不做磁盘 IO，放在这里最省事也最及时。
+func (e *Entry) notifyDoneLocked() {
+	if e.onDone != nil {
+		cb := e.onDone
+		e.onDone = nil
+		cb()
 	}
 }
 

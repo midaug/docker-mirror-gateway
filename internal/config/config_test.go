@@ -179,6 +179,80 @@ func TestCacheDirExpansion(t *testing.T) {
 	}
 }
 
+func TestDataDirAndPersistenceDefault(t *testing.T) {
+	cfg := Default()
+	if cfg.Data.Dir != "./data" {
+		t.Errorf("data.dir 默认值 = %q, 期望 ./data", cfg.Data.Dir)
+	}
+	if cfg.Data.Persist {
+		t.Error("data.persist 默认应为 false")
+	}
+	base, err := cfg.DataDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheDir, err := cfg.CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cacheDir != filepath.Join(base, "cache") {
+		t.Errorf("缓存目录应从数据目录派生: got %s, want %s", cacheDir, filepath.Join(base, "cache"))
+	}
+}
+
+// 开启缓存但不写 cache.dir 时应通过校验：目录由 data.dir 派生。
+func TestCacheEnabledWithoutDirDerives(t *testing.T) {
+	cfg := Default()
+	cfg.Cache.Enabled = true
+	cfg.Cache.Dir = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("开启缓存且 cache.dir 留空不应报错: %v", err)
+	}
+	dir, err := cfg.CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir == "" {
+		t.Error("派生的缓存目录为空")
+	}
+}
+
+func TestDataDirOverrideAndCacheDerivation(t *testing.T) {
+	t.Setenv("MIRROR_GATEWAY_DATA_DIR", "/srv/mirror-data")
+	t.Setenv("MIRROR_GATEWAY_DATA_PERSIST", "true")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := cfg.DataDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base != "/srv/mirror-data" {
+		t.Errorf("data.dir 覆盖失败: %s", base)
+	}
+	if !cfg.Data.Persist {
+		t.Error("data.persist 环境变量未生效")
+	}
+	cacheDir, err := cfg.CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cacheDir != filepath.Join(base, "cache") {
+		t.Errorf("缓存目录应随数据目录变化: %s", cacheDir)
+	}
+
+	// 显式配置 cache.dir 仍优先。
+	cfg.Cache.Dir = "/other/cache"
+	cacheDir, err = cfg.CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cacheDir != "/other/cache" {
+		t.Errorf("显式 cache.dir 未优先: %s", cacheDir)
+	}
+}
+
 func TestLoadMultiGroups(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

@@ -106,6 +106,9 @@ func isHiddenNotFound(body []byte) bool {
 // Options 是 Proxy 的行为参数。
 type Options struct {
 	MaxManifestBytes int64
+	// Activity 可选：外部构造的拉取记录器（例如开启文件持久化时）。
+	// 留空则由 Proxy 创建纯内存记录器。
+	Activity *activity.Tracker
 }
 
 // Proxy 实现 Docker Registry v2 的只读拉取代理与缓存。
@@ -129,12 +132,17 @@ func NewProxy(router *Router, c cache.Store, opts Options, log *slog.Logger, m *
 	if opts.MaxManifestBytes <= 0 {
 		opts.MaxManifestBytes = 8 << 20
 	}
+	tracker := opts.Activity
+	if tracker == nil {
+		// 与持久化模式相同的保留上限，控制台的「保留上限」文案在两种模式下一致。
+		tracker = activity.New(activity.DefaultStoreLimit)
+	}
 	p := &Proxy{
 		router:           router,
 		cache:            c,
 		log:              log,
 		maxManifestBytes: opts.MaxManifestBytes,
-		activity:         activity.New(activity.DefaultLimit),
+		activity:         tracker,
 	}
 	if m != nil {
 		p.hits = m.Counter("mirror_gateway_cache_hits_total", "缓存命中次数", nil)

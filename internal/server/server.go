@@ -429,7 +429,7 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := activity.DefaultLimit
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= activity.DefaultLimit {
 			limit = n
 		}
 	}

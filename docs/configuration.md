@@ -41,6 +41,21 @@
 | `routeTTL` | `30m` | 「仓库 → 分组」缓存时长 |
 | `negativeTTL` | `2m` | 「仓库不存在」负缓存时长 |
 
+## 数据目录与持久化
+
+`data.dir` 是统一的数据根目录，缓存（`cache.dir` 留空时为 `<data.dir>/cache`）和拉取监控记录（`<data.dir>/activity.json`）都在里面。Docker 部署只需挂载这一个目录：
+
+```yaml
+data:
+  dir: /var/lib/docker-mirror-gateway
+  persist: true
+```
+
+- `data.persist` 默认 `false`：不产生任何数据文件，适合下载可执行文件在本机直接运行。
+- 开启后，拉取记录写入 `activity.json`，节流合并写入（2 秒），退出时再保存一次；文件最多保留 1000 条，控制台仍只显示最近 100 条。
+- 写入采用「临时文件 + 原子改名」，文件损坏或目录不可写时只记一条警告，不影响拉取。
+- 对应环境变量：`MIRROR_GATEWAY_DATA_DIR`、`MIRROR_GATEWAY_DATA_PERSIST`。
+
 ## server / cache / health / selection / access / search / notify
 
 | 字段 | 默认值 | 说明 |
@@ -50,9 +65,11 @@
 | `server.publicURL` | 空 | 客户端访问地址，用于生成接入示例 |
 | `server.adminToken` | 空 | 管理接口与 `/metrics` 的令牌；空表示不校验 |
 | `server.maxManifestBytes` | `8MB` | 单个 manifest 大小上限 |
+| `data.dir` | `./data` | 统一数据目录，缓存和拉取记录都在这里；Docker 挂载这一个目录即可 |
+| `data.persist` | `false` | 是否把拉取监控记录写入 `data.dir/activity.json`。默认关闭：本地直接运行不会在磁盘留下数据文件；服务器/Docker 部署建议开启，重启后仍能查看历史记录 |
 | `cache.enabled` | `false` | 缓存总开关 |
 | `cache.backend` | `disk` | `disk` 或 `s3` |
-| `cache.dir` | `./data/cache` | 缓存目录，仅 `backend=disk` |
+| `cache.dir` | 空（= `data.dir/cache`） | 缓存目录，仅 `backend=disk`；显式配置则优先 |
 | `cache.maxSizeGB` | `50` | 容量上限，超出后按最久未访问淘汰到 85% |
 | `cache.tagTTL` | `5m` | tag → manifest 缓存有效期；digest 不受限 |
 | `cache.gcInterval` | `10m` | 定期清理间隔 |

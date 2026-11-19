@@ -364,7 +364,7 @@
   </section>
 
   <footer>
-    <span>状态每 5 秒刷新 · 拉取监控每 1.2 秒刷新 · 只保留最近 100 条</span>
+    <span>状态每 5 秒刷新 · 拉取监控每 1.2 秒刷新 · 页面显示最近 100 条</span>
     <span id="updated">-</span>
   </footer>
 </div>
@@ -608,7 +608,7 @@ function renderActivity(d) {
   if (sum.done) parts.push(`完成 ${sum.done}`);
   if (sum.cached) parts.push(`缓存 ${sum.cached}`);
   if (sum.failed) parts.push(`失败 ${sum.failed}`);
-  parts.push(`共保留 ${sum.total || 0} 条（上限 100）`);
+  parts.push(`共 ${sum.total || 0} 条记录（保留上限 1000）`);
   $('pulls-hint').textContent = parts.join(' · ');
 
   renderPulls();

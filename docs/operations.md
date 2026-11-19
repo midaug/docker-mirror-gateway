@@ -99,11 +99,15 @@ cache:
 ### 本地磁盘
 
 ```
-data/cache/
-├── blobs/sha256/<前2位>/<完整 hex>      blob 内容，按 digest 寻址
-└── manifests/<hash 前2位>/<hash>.bin    manifest 原始字节
-                            <hash>.json 元数据
+data/
+├── activity.json                       拉取监控记录（data.persist=true 时才有）
+└── cache/
+    ├── blobs/sha256/<前2位>/<完整 hex>  blob 内容，按 digest 寻址
+    └── manifests/<hash 前2位>/<hash>.bin  manifest 原始字节
+                              <hash>.json 元数据
 ```
+
+`activity.json` 最多保留 1000 条，控制台只显示最近 100 条；记录变化后节流写盘，退出时再保存一次。默认 `data.persist: false` 时不会有这个文件。
 
 - blob 用 `io.TeeReader` 边传边校验 sha256，通过才落盘；客户端中断则丢弃临时文件。
 - manifest 缓存键包含分组名与 Accept 变体，避免不同仓库的同名镜像、多架构清单与单平台清单互相覆盖。

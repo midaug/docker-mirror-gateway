@@ -32,9 +32,11 @@ services:
       - "127.0.0.1:${MIRROR_GATEWAY_ADMIN_PORT:-8081}:8081"
     environment:
       MIRROR_GATEWAY_ADMIN_ADDR: ":8081"
+      # 统一数据目录：缓存与拉取记录都在这里，只需挂载下面一个卷
+      MIRROR_GATEWAY_DATA_DIR: /var/lib/docker-mirror-gateway
+      MIRROR_GATEWAY_DATA_PERSIST: ${MIRROR_GATEWAY_DATA_PERSIST:-true}
       # 缓存默认关闭；需要时把 .env 里的 MIRROR_GATEWAY_CACHE_ENABLED 设为 true
       MIRROR_GATEWAY_CACHE_ENABLED: ${MIRROR_GATEWAY_CACHE_ENABLED:-false}
-      MIRROR_GATEWAY_CACHE_DIR: /var/lib/docker-mirror-gateway/cache
       MIRROR_GATEWAY_CACHE_MAX_GB: ${MIRROR_GATEWAY_CACHE_MAX_GB:-50}
       MIRROR_GATEWAY_LOG_LEVEL: ${MIRROR_GATEWAY_LOG_LEVEL:-info}
       # 留空表示管理接口不校验令牌
@@ -42,7 +44,8 @@ services:
     volumes:
       # 配置文件以只读方式挂载，修改后重启容器生效
       - ./config.yaml:/etc/docker-mirror-gateway/config.yaml:ro
-      # 缓存持久化，避免容器重建后重新回源；缓存关闭时这个卷不会写入
+      # 统一数据卷：拉取记录（开启持久化时）与缓存（开启缓存时）都在这里
+      # 卷名保持不变，已有部署升级后沿用原来的缓存数据
       - docker-mirror-gateway-cache:/var/lib/docker-mirror-gateway
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]

@@ -55,6 +55,7 @@ func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(),
 // Config 是 docker-mirror-gateway 的完整配置。
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
+	Data      DataConfig      `yaml:"data"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Access    AccessConfig    `yaml:"access"`
 	Search    SearchConfig    `yaml:"search"`
@@ -224,6 +225,17 @@ type ServerConfig struct {
 	MaxManifestBytes  int64    `yaml:"maxManifestBytes"`
 }
 
+// DataConfig 定义统一的数据目录与持久化开关。
+// 缓存、拉取记录等都放在 Dir 下，部署时只需挂载这一个目录。
+type DataConfig struct {
+	// Dir 是数据根目录（支持 ~ 与 ${ENV}）。默认 ./data。
+	Dir string `yaml:"dir"`
+	// Persist 是否把拉取监控记录写入数据目录的文件，默认关闭——
+	// 直接下载可执行文件本地运行时不会在磁盘上留下数据文件。
+	// 服务器 / Docker 部署建议开启，重启后仍能查看历史拉取记录。
+	Persist bool `yaml:"persist"`
+}
+
 type CacheConfig struct {
 	// Enabled 是缓存总开关，默认关闭：个人部署通常不需要额外占一块磁盘。
 	// 开启后按 Backend 选择落到本地磁盘还是 S3 兼容对象存储。
@@ -340,10 +352,14 @@ func Default() *Config {
 			IdleTimeout:       Duration(120 * time.Second),
 			MaxManifestBytes:  8 << 20,
 		},
+		Data: DataConfig{
+			Dir:     "./data",
+			Persist: false,
+		},
 		Cache: CacheConfig{
 			Enabled:        false,
 			Backend:        "disk",
-			Dir:            "./data/cache",
+			Dir:            "", // 留空时由 data.dir/cache 派生，保证只需挂载 data 目录
 			MaxSizeGB:      50,
 			TagTTL:         Duration(5 * time.Minute),
 			GCInterval:     Duration(10 * time.Minute),
@@ -476,6 +492,14 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("MIRROR_GATEWAY_ADMIN_TOKEN"); v != "" {
 		c.Server.AdminToken = v
 	}
+	if v := os.Getenv("MIRROR_GATEWAY_DATA_DIR"); v != "" {
+		c.Data.Dir = v
+	}
+	if v := os.Getenv("MIRROR_GATEWAY_DATA_PERSIST"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Data.Persist = b
+		}
+	}
 	if v := os.Getenv("MIRROR_GATEWAY_CACHE_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Cache.Enabled = b
@@ -536,11 +560,14 @@ func (c *Config) Validate() error {
 	}
 	switch c.Cache.Backend {
 	case "disk":
-		if c.Cache.Enabled && strings.TrimSpace(c.Cache.Dir) == "" {
-			return errors.New("启用缓存时 cache.dir 不能为空")
-		}
-		if c.Cache.Enabled && c.Cache.MaxSizeGB <= 0 {
-			return errors.New("启用磁盘缓存时 cache.maxSizeGB 必须大于 0")
+		// cache.dir 允许留空：由 data.dir/cache 派生，这里只校验派生可成功。
+		if c.Cache.Enabled {
+			if _, err := c.CacheDir(); err != nil {
+				return fmt.Errorf("解析缓存目录失败: %w", err)
+			}
+			if c.Cache.MaxSizeGB <= 0 {
+				return errors.New("启用磁盘缓存时 cache.maxSizeGB 必须大于 0")
+			}
 		}
 	case "s3":
 		if c.Cache.Enabled {
@@ -1045,12 +1072,32 @@ func (c *Config) GroupByName(name string) *GroupConfig {
 	return nil
 }
 
-// CacheDir 返回展开后的缓存目录绝对路径。缓存关闭或使用 S3 时返回空。
+// DataDir 返回展开后的统一数据目录绝对路径。
+// 缓存、拉取记录等都放在这里，部署时只需挂载这一个目录。
+func (c *Config) DataDir() (string, error) {
+	dir := strings.TrimSpace(c.Data.Dir)
+	if dir == "" {
+		dir = "./data"
+	}
+	return expandDir(dir)
+}
+
+// CacheDir 返回展开后的缓存目录绝对路径。
+// cache.dir 留空时取 data.dir 下的 cache 子目录；显式配置仍优先。
 func (c *Config) CacheDir() (string, error) {
 	dir := strings.TrimSpace(c.Cache.Dir)
 	if dir == "" {
-		return "", nil
+		base, err := c.DataDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(base, "cache"), nil
 	}
+	return expandDir(dir)
+}
+
+// expandDir 展开 ~ 前缀并返回绝对路径。
+func expandDir(dir string) (string, error) {
 	if strings.HasPrefix(dir, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
