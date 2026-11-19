@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +46,40 @@ func isDenylistBody(body []byte) bool {
 	return strings.Contains(low, "denied") ||
 		strings.Contains(low, "allowlist") ||
 		strings.Contains(low, "白名单")
+}
+
+// isHiddenNotFound 判断上游错误响应的 body 是否实际表达「不存在」语义。
+// 部分镜像源（如 dockerproxy）把 registry 的 404 MANIFEST_UNKNOWN /
+// BLOB_UNKNOWN 包装成 500 UNKNOWN 返回，真实错误码藏在 detail.errors 里，
+// 从 body 错误码还原语义，避免把「镜像不存在」误判为源故障（误降级、误报 502）。
+func isHiddenNotFound(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var parsed struct {
+		Errors []struct {
+			Code   string `json:"code"`
+			Detail struct {
+				Errors []struct {
+					Code string `json:"code"`
+				} `json:"errors"`
+			} `json:"detail"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false
+	}
+	for _, e := range parsed.Errors {
+		if e.Code == "MANIFEST_UNKNOWN" || e.Code == "BLOB_UNKNOWN" || e.Code == "NAME_UNKNOWN" {
+			return true
+		}
+		for _, de := range e.Detail.Errors {
+			if de.Code == "MANIFEST_UNKNOWN" || de.Code == "BLOB_UNKNOWN" || de.Code == "NAME_UNKNOWN" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Options 是 Proxy 的行为参数。
@@ -218,13 +253,19 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 		p.log.Warn("从上游获取 manifest 失败", "group", route.Group.Name, "upstream", u.Name, "repo", name, "ref", ref, "error", err)
 	}
 
-	// 健康源一致 404（连同白名单拒绝的兜底源）时按 404 语义返回。
-	// 典型场景：docker 拉取 OCI attestation manifest（platform=unknown），
-	// 多数镜像站没有同步它，若返回 502 + 兜底源的 403，整个 pull 会中断。
-	if notFound > 0 && notFound+denied == attempted {
+	// 所有源都明确「不提供」（404 或 401/403 仓库级策略拒绝）时按 404 语义
+	// 返回。典型场景：docker 拉取 OCI attestation manifest（platform=unknown）
+	// 多数镜像站没有同步它；或 Elastic 等源对不存在的仓库统一返回
+	// 401 authentication required——此时「镜像不存在」是最可能的真相，
+	// 返回 502 + 401/403 详情只会误导客户端把整个 pull 中断。
+	if notFound+denied == attempted {
 		msg := "镜像不存在"
 		if denied > 0 {
-			msg = fmt.Sprintf("各镜像源均未提供此镜像（%d 个源因白名单策略拒绝提供）", denied)
+			if notFound > 0 {
+				msg = fmt.Sprintf("各镜像源均未提供此镜像（%d 个源因白名单策略拒绝提供）", denied)
+			} else {
+				msg = fmt.Sprintf("各镜像源均拒绝提供此镜像（%d 个源要求认证或受白名单限制）", denied)
+			}
 		}
 		act.Fail(errors.New(msg))
 		writeRegistryError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", msg, map[string]string{"name": name, "reference": ref})
@@ -259,14 +300,19 @@ func (p *Proxy) fetchManifest(ctx context.Context, u *Upstream, name, ref, accep
 		return nil, errNotFound
 	case http.StatusUnauthorized, http.StatusForbidden:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		if resp.StatusCode == http.StatusForbidden && isDenylistBody(body) {
-			// DaoCloud public-image-mirror 等按仓库白名单放行的源：
-			// 对不在白名单的仓库一律 403 DENIED，是仓库级策略而非源故障。
+		// 401 UNAUTHORIZED 是 registry 对不存在/私有仓库的标准响应（网关匿名
+		// 拉取无法提供凭证）；403 白名单特征（如 DaoCloud DENIED）是仓库级
+		// 策略——都不是源故障，换源重试且不计健康降级。
+		if resp.StatusCode == http.StatusUnauthorized || isDenylistBody(body) {
 			return nil, &deniedError{msg: fmt.Sprintf("%s 拒绝访问(%d): %s", u.Name, resp.StatusCode, snippet(body))}
 		}
+		// 无特征的 403 视为真实权限问题，计入健康降级。
 		return nil, fmt.Errorf("%s 拒绝访问(%d): %s", u.Name, resp.StatusCode, snippet(body))
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		if resp.StatusCode == http.StatusInternalServerError && isHiddenNotFound(body) {
+			return nil, errNotFound // 源把 404 包装成 500，按不存在处理
+		}
 		return nil, fmt.Errorf("%s 返回 %d: %s", u.Name, resp.StatusCode, snippet(body))
 	}
 
@@ -401,6 +447,7 @@ func (p *Proxy) headBlob(w http.ResponseWriter, r *http.Request, route *Route, d
 	var (
 		lastErr   error
 		notFound  int
+		denied    int
 		attempted int
 	)
 	for _, u := range route.Group.Pool.Candidates() {
@@ -446,6 +493,12 @@ func (p *Proxy) headBlob(w http.ResponseWriter, r *http.Request, route *Route, d
 			notFound++
 			u.ReportSuccess(time.Since(start))
 			continue
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			// HEAD 无响应体，但 401/403 状态码本身就表达仓库级策略拒绝
+			//（不存在/私有仓库、白名单外仓库），不是源故障：不降级、换源。
+			denied++
+			lastErr = fmt.Errorf("%s 拒绝访问(%d)", u.Name, resp.StatusCode)
+			continue
 		default:
 			lastErr = fmt.Errorf("%s 返回 %d", u.Name, resp.StatusCode)
 			if isUpstreamFault(resp.StatusCode) {
@@ -455,7 +508,7 @@ func (p *Proxy) headBlob(w http.ResponseWriter, r *http.Request, route *Route, d
 		}
 	}
 
-	if notFound > 0 && notFound == attempted {
+	if notFound+denied == attempted {
 		writeRegistryError(w, http.StatusNotFound, "BLOB_UNKNOWN", "blob 不存在", map[string]string{"digest": digest})
 		return
 	}
@@ -525,9 +578,17 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 		default:
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusForbidden && isDenylistBody(body) {
-				// 白名单拒绝是仓库级策略而非源故障：不降级健康度，
-				// 但照常归因并继续尝试下一个源。
+			if resp.StatusCode == http.StatusInternalServerError && isHiddenNotFound(body) {
+				// 源把 404 BLOB_UNKNOWN 包装成 500，按不存在处理。
+				notFound++
+				u.ReportSuccess(time.Since(start))
+				act.SetUpstream(u.Name)
+				continue
+			}
+			if (resp.StatusCode == http.StatusForbidden && isDenylistBody(body)) || resp.StatusCode == http.StatusUnauthorized {
+				// 401 UNAUTHORIZED（registry 对不存在/私有仓库的标准响应）
+				// 与 403 白名单拒绝同属仓库级策略而非源故障：不降级健康度，
+				// 照常归因并继续尝试下一个源。
 				denied++
 				lastErr = &deniedError{msg: fmt.Sprintf("%s 拒绝访问(%d): %s", u.Name, resp.StatusCode, snippet(body))}
 				act.SetUpstream(u.Name)
@@ -597,10 +658,14 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 		return
 	}
 
-	if notFound > 0 && notFound+denied == attempted {
+	if notFound+denied == attempted {
 		msg := "blob 不存在"
 		if denied > 0 {
-			msg = fmt.Sprintf("各镜像源均未提供此 blob（%d 个源因白名单策略拒绝提供）", denied)
+			if notFound > 0 {
+				msg = fmt.Sprintf("各镜像源均未提供此 blob（%d 个源因白名单策略拒绝提供）", denied)
+			} else {
+				msg = fmt.Sprintf("各镜像源均拒绝提供此 blob（%d 个源要求认证或受白名单限制）", denied)
+			}
 		}
 		act.Fail(errors.New(msg))
 		writeRegistryError(w, http.StatusNotFound, "BLOB_UNKNOWN", msg, map[string]string{"digest": digest})
@@ -704,6 +769,12 @@ func (p *Proxy) ServeTags(w http.ResponseWriter, r *http.Request, name string) {
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 			resp.Body.Close()
+			if resp.StatusCode == http.StatusInternalServerError && isHiddenNotFound(body) {
+				// 源把 404 NAME_UNKNOWN/MANIFEST_UNKNOWN 包装成 500，按不存在处理。
+				notFound++
+				u.ReportSuccess(time.Since(start))
+				continue
+			}
 			lastErr = fmt.Errorf("%s 返回 %d: %s", u.Name, resp.StatusCode, snippet(body))
 			if isUpstreamFault(resp.StatusCode) {
 				u.ReportFailure(lastErr)

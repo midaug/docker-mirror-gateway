@@ -35,17 +35,27 @@ type fakeManifest struct {
 // fakeRegistry 模拟一个带 token 认证的 Docker Registry。
 type fakeRegistry struct {
 	*httptest.Server
-	t              *testing.T
-	token          string
-	manifests      map[string]fakeManifest
-	blobs          map[string][]byte
-	fail           bool
-	deny           map[string]bool // 这些仓库返回 403 DENIED 白名单响应
-	plainForbidden map[string]bool // 这些仓库返回无特征的 403
-	manifestReqs   atomic.Int64
-	blobReqs       atomic.Int64
-	tagsReqs       atomic.Int64
-	seen           atomic.Value
+	t                 *testing.T
+	token             string
+	manifests         map[string]fakeManifest
+	blobs             map[string][]byte
+	fail              bool
+	deny              map[string]bool // 这些仓库返回 403 DENIED 白名单响应
+	plainForbidden    map[string]bool // 这些仓库返回无特征的 403
+	unauthorizedRepos map[string]bool // 这些仓库返回 401 authentication required
+	wrapNotFound      bool            // 把 404 包装成 500 UNKNOWN（模拟 dockerproxy）
+	manifestReqs      atomic.Int64
+	blobReqs          atomic.Int64
+	tagsReqs          atomic.Int64
+	seen              atomic.Value
+}
+
+// writeWrappedNotFound 模拟 dockerproxy 把 404 包装成 500 UNKNOWN 的响应，
+// 真实错误码藏在 detail.errors[0].code 里。
+func (f *fakeRegistry) writeWrappedNotFound(w http.ResponseWriter, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = io.WriteString(w, `{"errors":[{"code":"UNKNOWN","message":"unknown error","detail":{"errors":[{"code":"`+code+`","message":"manifest unknown","detail":{}}]}}]}`)
 }
 
 func newFakeRegistry(t *testing.T) *fakeRegistry {
@@ -98,12 +108,23 @@ func (f *fakeRegistry) handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
+	if f.unauthorizedRepos[name] {
+		// 模拟 Elastic 等源：对不存在/私有的仓库返回 401 authentication required
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`)
+		return
+	}
 	switch kind {
 	case PathManifest:
 		f.manifestReqs.Add(1)
 		m, ok := f.manifests[name+"@"+ref]
 		if !ok {
-			w.WriteHeader(http.StatusNotFound)
+			if f.wrapNotFound {
+				f.writeWrappedNotFound(w, "MANIFEST_UNKNOWN")
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
 			return
 		}
 		w.Header().Set("Content-Type", m.mediaType)
@@ -133,7 +154,11 @@ func (f *fakeRegistry) handle(w http.ResponseWriter, r *http.Request) {
 		f.blobReqs.Add(1)
 		data, ok := f.blobs[ref]
 		if !ok {
-			w.WriteHeader(http.StatusNotFound)
+			if f.wrapNotFound {
+				f.writeWrappedNotFound(w, "BLOB_UNKNOWN")
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
 			return
 		}
 		if r.Header.Get("Range") != "" {
@@ -573,5 +598,109 @@ func TestProxyBlobDenylistFallback(t *testing.T) {
 	items := p.Activity().List(0)
 	if len(items) == 0 || items[0].Upstream != "deny" {
 		t.Errorf("失败记录上游 = %+v, 期望 deny", items)
+	}
+}
+
+// Elastic 等源对不存在/私有的仓库返回 401 authentication required（而非 404）。
+// 若另一源正常返回 404，链尾应按 404 MANIFEST_UNKNOWN 返回（镜像不存在是最可能
+// 的真相），而不是把 401 包成 502；且 401 不应降级源健康度。
+func TestProxyManifestUnauthorizedAsPolicy(t *testing.T) {
+	ok := newFakeRegistry(t) // 不存在的 manifest → 404
+	elastic := newFakeRegistry(t)
+	elastic.unauthorizedRepos = map[string]bool{"library/nginx": true}
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "ok", URL: ok.URL, Priority: 10},
+		{Name: "elastic", URL: elastic.URL, Priority: 20},
+	}, c)
+
+	missing := "sha256:" + strings.Repeat("ef", 32)
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/"+missing, nil), "library/nginx", missing)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d, 期望 404（而非 401 包成的 502）, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 失败归因到最后尝试的源
+	items := p.Activity().List(0)
+	if len(items) == 0 || items[0].Upstream != "elastic" {
+		t.Errorf("失败记录上游 = %+v, 期望 elastic", items)
+	}
+
+	// 401 不应降级源健康度
+	for _, g := range p.router.Groups() {
+		if g.Name == "test" {
+			for _, u := range g.Pool.Upstreams() {
+				if u.Name == "elastic" && !u.Healthy() {
+					t.Errorf("401 不应降级 elastic 源健康度")
+				}
+			}
+		}
+	}
+}
+
+// dockerproxy 等源把 404 MANIFEST_UNKNOWN/BLOB_UNKNOWN 包装成 500 UNKNOWN。
+// 网关应从 body 错误码还原 404 语义（换源、不降级），而不是误判为源故障。
+func TestProxyManifestWrappedNotFound(t *testing.T) {
+	ok := newFakeRegistry(t)
+	wrapped := newFakeRegistry(t)
+	wrapped.wrapNotFound = true
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "ok", URL: ok.URL, Priority: 10},
+		{Name: "wrapped", URL: wrapped.URL, Priority: 20},
+	}, c)
+
+	missing := "sha256:" + strings.Repeat("12", 32)
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/"+missing, nil), "library/nginx", missing)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d, 期望 404, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// wrapped 源把 404 包装成 500，不应被降级健康度
+	for _, g := range p.router.Groups() {
+		if g.Name == "test" {
+			for _, u := range g.Pool.Upstreams() {
+				if u.Name == "wrapped" && !u.Healthy() {
+					t.Errorf("包装 404 为 500 不应降级 wrapped 源健康度")
+				}
+			}
+		}
+	}
+}
+
+// blob 路径同样识别被包装的 BLOB_UNKNOWN。
+func TestProxyBlobWrappedNotFound(t *testing.T) {
+	ok := newFakeRegistry(t)
+	ok.blobs["sha256:"+strings.Repeat("aa", 32)] = []byte("data")
+	wrapped := newFakeRegistry(t)
+	wrapped.wrapNotFound = true
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "ok", URL: ok.URL, Priority: 10},
+		{Name: "wrapped", URL: wrapped.URL, Priority: 20},
+	}, c)
+
+	missing := "sha256:" + strings.Repeat("34", 32)
+	rec := httptest.NewRecorder()
+	p.ServeBlob(rec, httptest.NewRequest(http.MethodGet, "/v2/library/nginx/blobs/"+missing, nil), "library/nginx", missing)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d, 期望 404, body=%s", rec.Code, rec.Body.String())
+	}
+	for _, g := range p.router.Groups() {
+		if g.Name == "test" {
+			for _, u := range g.Pool.Upstreams() {
+				if u.Name == "wrapped" && !u.Healthy() {
+					t.Errorf("包装 404 为 500 不应降级 wrapped 源健康度")
+				}
+			}
+		}
 	}
 }
