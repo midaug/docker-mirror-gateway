@@ -44,6 +44,7 @@ type fakeRegistry struct {
 	plainForbidden    map[string]bool // 这些仓库返回无特征的 403
 	unauthorizedRepos map[string]bool // 这些仓库返回 401 authentication required
 	wrapNotFound      bool            // 把 404 包装成 500 UNKNOWN（模拟 dockerproxy）
+	tokenDeniedScopes map[string]bool // token 接口对这些 scope 返回 403（模拟 ghcr.io）
 	manifestReqs      atomic.Int64
 	blobReqs          atomic.Int64
 	tagsReqs          atomic.Int64
@@ -68,6 +69,13 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		// 模拟 token 接口对特定仓库 scope 返回 403 DENIED（ghcr.io 对
+		// 不存在仓库的匿名令牌请求行为）
+		if f.tokenDeniedScopes[r.URL.Query().Get("scope")] {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}`)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"token":"test-token","expires_in":300}`)
 	})
@@ -702,5 +710,62 @@ func TestProxyBlobWrappedNotFound(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// ghcr.io 等源对不存在仓库的令牌请求返回 403 DENIED，sparkcr 等源对未同步
+// 的仓库返回 401 且无认证挑战——两种都应视为仓库级策略：换源重试、不降级。
+func TestProxyManifestTokenDeniedIsRepoPolicy(t *testing.T) {
+	ok := newFakeRegistry(t)
+	ok.addManifest("library/nginx", "latest", MediaTypeDockerManifest,
+		[]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{}}`))
+	strict := newFakeRegistry(t)
+	strict.tokenDeniedScopes = map[string]bool{"repository:library/nginx:pull": true}
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "ok", URL: ok.URL, Priority: 10},
+		{Name: "strict", URL: strict.URL, Priority: 20},
+	}, c)
+
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, httptest.NewRequest(http.MethodGet, "/v2/library/nginx/manifests/latest", nil), "library/nginx", "latest")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（从 ok 源拉取）, body=%s", rec.Code, rec.Body.String())
+	}
+	// strict 源的 token 被拒，不应降级其健康度
+	for _, g := range p.router.Groups() {
+		if g.Name == "test" {
+			for _, u := range g.Pool.Upstreams() {
+				if u.Name == "strict" && !u.Healthy() {
+					t.Errorf("token 接口 403 不应降级 strict 源健康度")
+				}
+			}
+		}
+	}
+}
+
+// 所有源的令牌都被拒绝时，返回 404 而不是把 token 错误包成 502。
+func TestProxyManifestAllTokenDenied(t *testing.T) {
+	a := newFakeRegistry(t)
+	a.tokenDeniedScopes = map[string]bool{"repository:library/private:pull": true}
+	b := newFakeRegistry(t)
+	b.tokenDeniedScopes = map[string]bool{"repository:library/private:pull": true}
+
+	c := newTestCache(t)
+	p := newTestProxy(t, []config.UpstreamConfig{
+		{Name: "a", URL: a.URL, Priority: 10},
+		{Name: "b", URL: b.URL, Priority: 20},
+	}, c)
+
+	rec := httptest.NewRecorder()
+	p.ServeManifest(rec, httptest.NewRequest(http.MethodGet, "/v2/library/private/manifests/latest", nil), "library/private", "latest")
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d, 期望 404, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "MANIFEST_UNKNOWN") {
+		t.Errorf("错误码不符合 Registry 规范: %s", rec.Body.String())
 	}
 }

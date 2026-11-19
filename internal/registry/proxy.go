@@ -248,6 +248,14 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 			lastErr = err
 			continue
 		}
+		if errors.Is(err, ErrUnauthorized) {
+			// 令牌接口拒绝（token 接口对不存在的仓库返回 403 DENIED）或
+			// 401 无认证挑战——源在线但不对匿名提供这个仓库，同样是
+			// 仓库级策略：不降级，换源重试。
+			denied++
+			lastErr = err
+			continue
+		}
 		lastErr = err
 		u.ReportFailure(err)
 		p.log.Warn("从上游获取 manifest 失败", "group", route.Group.Name, "upstream", u.Name, "repo", name, "ref", ref, "error", err)
@@ -275,6 +283,11 @@ func (p *Proxy) ServeManifest(w http.ResponseWriter, r *http.Request, name, ref 
 	msg := "所有上游镜像源均不可用"
 	if lastErr != nil {
 		msg = lastErr.Error()
+	}
+	if missing := notFound + denied; missing > 0 {
+		// 混合场景：部分源故障（网络/5xx），其余源未收录此仓库。
+		// 把「未收录」单独说明，避免用户误以为报错的那个源就是唯一原因。
+		msg = fmt.Sprintf("%s（另有 %d 个镜像源未收录此镜像）", msg, missing)
 	}
 	writeRegistryError(w, http.StatusBadGateway, "UNKNOWN", msg, nil)
 }
@@ -462,6 +475,11 @@ func (p *Proxy) headBlob(w http.ResponseWriter, r *http.Request, route *Route, d
 				return // 客户端已断开，这不是上游的错，不计失败
 			}
 			lastErr = err
+			if errors.Is(err, ErrUnauthorized) {
+				// 令牌接口拒绝或 401 无挑战：仓库级策略而非源故障，不降级。
+				denied++
+				continue
+			}
 			u.ReportFailure(err)
 			continue
 		}
@@ -550,6 +568,12 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 			}
 			lastErr = err
 			act.SetUpstream(u.Name)
+			if errors.Is(err, ErrUnauthorized) {
+				// 令牌接口拒绝或 401 无挑战：源不对匿名提供这个仓库，
+				// 仓库级策略而非源故障，不降级，换源重试。
+				denied++
+				continue
+			}
 			u.ReportFailure(err)
 			continue
 		}
@@ -675,6 +699,11 @@ func (p *Proxy) streamBlob(w http.ResponseWriter, r *http.Request, route *Route,
 	msg := "所有上游镜像源均不可用"
 	if lastErr != nil {
 		msg = lastErr.Error()
+	}
+	if missing := notFound + denied; missing > 0 {
+		// 混合场景：部分源故障（网络/5xx），其余源未收录此仓库。
+		// 把「未收录」单独说明，避免用户误以为报错的那个源就是唯一原因。
+		msg = fmt.Sprintf("%s（另有 %d 个镜像源未收录此镜像）", msg, missing)
 	}
 	writeRegistryError(w, http.StatusBadGateway, "UNKNOWN", msg, nil)
 }
