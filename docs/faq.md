@@ -44,8 +44,8 @@ dockerproxy 等源对不存在的 manifest/blob 返回 500，但 body 里带 `MA
 **配置了 adminAddr 后，拉取端口访问控制台是 404**
 预期行为，控制台与管理接口只在管理端口。
 
-**NAS / 面板里的镜像搜索没有结果**
-这类客户端多数还在用 Docker Registry v1 的 `GET /v1/search?q=...`。网关已兼容该接口，结果来自与控制台相同的多源搜索（`search.sources`），返回 `num_results` / `results` 结构；`n`、`page` 参数照常生效。
+**群晖 Docker / NAS 面板里的镜像搜索没有结果**
+群晖 Docker（DSM / Container Manager）的注册表搜索走的是 Docker Registry v1 的 `GET /v1/search?q=...`。网关已兼容该接口，结果来自与控制台相同的多源搜索（`search.sources`），返回 `num_results` / `results` 结构；`n`、`page` 参数照常生效。搜索没有结果时依次确认：`search.enabled` 没有被关掉（关掉时该接口返回 404）、客户端 IP 在 `access` 白名单内、网关日志里 `path=/v1/search` 的请求确实到达。
 
 **`GET /v2/_catalog` 只列出部分仓库**
 网关是拉取代理，无法枚举上游全部仓库。`_catalog` 返回的是拉取记录里出现过的仓库名（去重、按名称排序，支持 `n` / `last` 分页），够 NAS、面板类 UI 浏览；没拉过的仓库不会出现在列表里。

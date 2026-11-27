@@ -165,7 +165,7 @@ access:
 | GET | `/v1/search?q=nginx&n=25&page=1` | Docker Registry v1 搜索，结果来自与控制台相同的多源搜索（受 `search.enabled` 控制） |
 | GET | `/v2/_catalog?n=100&last=...` | 仓库目录：拉取记录中出现过的仓库名去重、按名称排序，支持 `n` / `last` 分页 |
 
-部分 NAS、面板类镜像界面仍按 Docker Hub 的旧接口发现镜像，缺了这两个端点会直接显示搜索为空或列表加载失败。两者与 `/v2/` 一样受 IP 白名单约束。
+这两个端点的主要用途是兼容群晖 Docker（DSM / Container Manager）的注册表搜索：它先请求 `/v2/_catalog` 拿已加载的镜像仓库，再用 `/v1/search?q=...` 搜索 Hub 仓库，缺了就会显示搜索为空或列表加载失败。其他 NAS、面板类镜像界面同理。两者与 `/v2/` 一样受 IP 白名单约束。
 
 ## 管理接口与监控
 

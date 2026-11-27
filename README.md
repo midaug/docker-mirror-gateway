@@ -40,7 +40,7 @@ Docker / containerd ──▶ Docker Mirror Gateway ──┬──▶ dockerhub
 - **pull-through 缓存** — 本地磁盘或 S3，blob 边传边校验（默认关闭）。
 - **源级代理** — 每个上游可单独配置 http/socks5 代理（含认证）或强制直连。
 - **控制台** — 镜像搜索（含版本号过滤与跳转源页面）、拉取监控（可选落盘，重启不丢）、上游与路由状态。
-- **旧客户端兼容** — 拉取端口支持 Registry v1 的 `/v1/search` 与 `/v2/_catalog`，NAS、面板类镜像界面可直接搜索和浏览。
+- **旧客户端兼容** — 拉取端口支持 Registry v1 的 `/v1/search` 与 `/v2/_catalog`，群晖 Docker（DSM / Container Manager）的注册表搜索、NAS 与面板类镜像界面可直接搜索和浏览。
 - **安全** — 拉取与管理端口分离、IP 白名单、adminToken；每个源独立选择「配置账号自动认证」或「客户端凭证透传」，默认不透传，公网多域名部署可为官方源开启透传。
 - **轻量** — 单二进制约 12 MB（压缩包 4~5 MB），空载 CPU 不到 1%、内存约 20 MB，树莓派也能长期跑。
 
@@ -118,6 +118,17 @@ make build && ./bin/docker-mirror-gateway -config config.yaml
 ```
 
 其他仓库（GHCR、Quay 等）与 containerd / K8s / Podman 的接入方式、HTTPS 反代见[路由与客户端接入](docs/routing.md)。
+
+### 群晖 Docker 注册表搜索
+
+群晖 DSM 的 Docker / Container Manager 在「注册表」里搜索镜像时走的是 Docker Registry v1 的旧接口：先查 `/v2/_catalog` 列出已加载的仓库，再用 `GET /v1/search?q=...` 搜索。网关在拉取端口实现了这两个接口，把网关地址添加为注册表即可直接搜索：
+
+- 搜索结果来自与控制台同一套多源搜索（`search.sources`，默认 `hub` / `quay` / `mcr`），选中后仍从网关拉取镜像。
+- 需要 `search.enabled: true`（默认开启）；关掉搜索后 `/v1/search` 返回 404，群晖里会显示搜索为空。
+- 与 `/v2/` 一样受 `access.allow` / `access.deny` IP 白名单约束。
+- 群晖「镜像」列表依赖 `GET /v2/_catalog`，其中只包含网关拉取过的仓库，没拉过的不会出现。
+
+细节见[运行与运维 · 拉取端兼容接口](docs/operations.md#拉取端兼容接口)。
 
 ## 默认配置
 
