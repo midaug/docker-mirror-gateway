@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -289,14 +290,22 @@ func newV1SearchServer(t *testing.T, hub http.Handler) *Server {
 	}
 	client := &http.Client{Transport: &rewriteTransport{target: target, base: http.DefaultTransport}}
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := search.New(client, 2*time.Second, []string{"hub"}, false, log, search.WithHubClient(client))
+	// 打开补查开关，确认 v1 接口确实跳过了标签补查（否则测试没有意义）。
+	svc := search.New(client, 2*time.Second, []string{"hub"}, true, log,
+		search.WithHubClient(client), search.WithTags(true))
 	s := newTestServer(t, "")
 	s.search = svc
 	return s
 }
 
 func TestV1SearchCompat(t *testing.T) {
+	var tagHits int
 	hub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tags/") {
+			tagHits++
+			io.WriteString(w, `{"results":[]}`)
+			return
+		}
 		if r.URL.Path != "/v2/search/repositories/" {
 			t.Errorf("请求路径 = %q", r.URL.Path)
 		}
@@ -330,6 +339,10 @@ func TestV1SearchCompat(t *testing.T) {
 	}
 	if first.Description != "Official build of Nginx." || first.IsAutomated {
 		t.Errorf("首条结果其余字段 = %+v", first)
+	}
+	// v1 响应不包含版本号，服务端不应为此补查标签（每条结果一次上游请求）。
+	if tagHits != 0 {
+		t.Errorf("v1 搜索补查标签 %d 次, 期望 0", tagHits)
 	}
 
 	// 第二页取剩余结果。
@@ -368,6 +381,9 @@ func TestCatalogListsKnownRepositories(t *testing.T) {
 		e := tracker.Begin("manifest", repo, "latest", "dockerhub")
 		e.Finish()
 	}
+	// 拉取失败的仓库不进目录：打错名字的 404 尝试也会留下记录。
+	failed := tracker.Begin("manifest", "library/notfound", "latest", "dockerhub")
+	failed.Fail(errors.New("manifest 不存在"))
 
 	var body struct {
 		Repositories []string `json:"repositories"`

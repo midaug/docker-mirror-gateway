@@ -361,7 +361,8 @@ func (s *Server) handleV1Search(w http.ResponseWriter, r *http.Request) {
 	if page > 1 {
 		fetch = v1SearchMaxLimit
 	}
-	resp := s.search.Search(r.Context(), query, fetch)
+	// v1 只需要名字/描述/star 数，跳过标签补查，省掉前 20 条结果各一次上游请求。
+	resp := s.search.SearchBasic(r.Context(), query, fetch)
 	start := (page - 1) * n
 	results := make([]v1SearchResult, 0, n)
 	for i := start; i < len(resp.Results) && len(results) < n; i++ {

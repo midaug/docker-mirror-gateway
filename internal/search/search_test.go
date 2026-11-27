@@ -827,3 +827,86 @@ func TestHubAuthInvalidatesOnUnauthorized(t *testing.T) {
 		t.Errorf("第二次搜索登录次数 = %d, 期望 2（401 后应清缓存重登录）", loginHits)
 	}
 }
+
+// 缓存的 token 失效时（Hub 返回 401），应换一次新 token 重试，
+// 而不是让这次搜索直接缺 Hub 结果、并把 Hub 打进 30 秒冷却。
+func TestHubAuthRetriesOnceAfterTokenRejected(t *testing.T) {
+	oldLogin := hubLoginURL
+	t.Cleanup(func() { hubLoginURL = oldLogin })
+
+	var loginHits atomic.Int64
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := loginHits.Add(1)
+		io.WriteString(w, fmt.Sprintf(`{"token":"token-%d"}`, n))
+	}))
+	defer login.Close()
+	hubLoginURL = login.URL + "/v2/users/login/"
+
+	var rejectFirst atomic.Bool
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tags/") {
+			io.WriteString(w, `{"results":[]}`)
+			return
+		}
+		if rejectFirst.Load() && r.Header.Get("Authorization") == "Bearer token-1" {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"detail":"token expired"}`)
+			return
+		}
+		io.WriteString(w, `{"count":1,"results":[{"repo_name":"library/nginx","short_description":"x","star_count":1,"pull_count":1}]}`)
+	}))
+	defer hub.Close()
+	stubSources(t, hub, nil)
+
+	svc := New(nil, 3*time.Second, []string{"hub"}, false, discardLogger(),
+		WithHubClient(hub.Client()), WithHubAuth("alice", "pat"))
+
+	// 第一次搜索：登录拿到 token-1，Hub 正常返回。
+	resp := svc.Search(context.Background(), "nginx", 5)
+	if resp.Errors != nil || len(resp.Results) != 1 {
+		t.Fatalf("第一次搜索失败: errors=%v results=%d", resp.Errors, len(resp.Results))
+	}
+	// 之后 token-1 被 Hub 拒绝（过期/吊销），缓存的 token 还在。
+	rejectFirst.Store(true)
+	resp = svc.Search(context.Background(), "nginx", 5)
+	if resp.Errors != nil || len(resp.Results) != 1 {
+		t.Fatalf("401 后应换新 token 重试成功: errors=%v results=%d", resp.Errors, len(resp.Results))
+	}
+	if got := loginHits.Load(); got != 2 {
+		t.Errorf("登录次数 = %d, 期望 2（首次 + 401 后重登）", got)
+	}
+	if svc.coolingDown("hub") {
+		t.Error("重试成功后 Hub 不应进入冷却")
+	}
+}
+
+// 刚换到的新 token 仍被拒绝，说明凭据或账号有问题，不该无限重登。
+func TestHubAuthDoesNotRetryFreshToken(t *testing.T) {
+	oldLogin := hubLoginURL
+	t.Cleanup(func() { hubLoginURL = oldLogin })
+
+	var loginHits atomic.Int64
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		loginHits.Add(1)
+		io.WriteString(w, `{"token":"fresh-token"}`)
+	}))
+	defer login.Close()
+	hubLoginURL = login.URL + "/v2/users/login/"
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"detail":"account disabled"}`)
+	}))
+	defer hub.Close()
+	stubSources(t, hub, nil)
+
+	svc := New(nil, 3*time.Second, []string{"hub"}, false, discardLogger(),
+		WithHubClient(hub.Client()), WithHubAuth("alice", "pat"))
+	svc.Search(context.Background(), "nginx", 5)
+	if got := loginHits.Load(); got != 1 {
+		t.Errorf("刚换的 token 被拒后登录次数 = %d, 期望 1（不重复重登）", got)
+	}
+	if !svc.coolingDown("hub") {
+		t.Error("凭据无效时 Hub 应进入冷却，避免每次搜索都重登")
+	}
+}

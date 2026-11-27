@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -54,15 +55,18 @@ func newHubTokenProvider(username, password string, client *http.Client, log *sl
 }
 
 // refresh 在需要时换取新 token。用搜索的总 ctx 调用，给登录留足预算。
-func (p *hubTokenProvider) refresh(ctx context.Context) {
+//
+// 返回 true 表示本次调用确实登录换到了新 token。调用方据此判断：如果
+// token 是刚换来的还被判 401，重试没有意义（凭据本身有问题），不该再登一次。
+func (p *hubTokenProvider) refresh(ctx context.Context) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 	if p.token != "" && now.Before(p.expires) {
-		return
+		return false
 	}
 	if now.Before(p.retryAt) {
-		return
+		return false
 	}
 	token, err := p.login(ctx)
 	if err != nil {
@@ -70,12 +74,13 @@ func (p *hubTokenProvider) refresh(ctx context.Context) {
 		p.retryAt = now.Add(hubTokenRetry)
 		// 不打印凭据，只记录错误类型。
 		p.log.Warn("Docker Hub 账号认证失败，搜索降级为匿名", "error", err)
-		return
+		return false
 	}
 	p.token = token
 	p.expires = now.Add(hubTokenLifetime)
 	p.retryAt = time.Time{}
 	p.log.Info("Docker Hub 搜索已启用账号认证", "user", p.username)
+	return true
 }
 
 // bearer 返回当前可用的 Authorization 值；无有效 token 时返回空串。
@@ -144,12 +149,26 @@ func (p *hubTokenProvider) login(ctx context.Context) (string, error) {
 type hubAuthTransport struct {
 	base     http.RoundTripper
 	provider *hubTokenProvider
+	// host 是唯一允许携带 token 的主机名（hub.docker.com）。
+	// 限定主机，避免上游重定向把 Bearer token 带到第三方域名。
+	host string
 }
 
 func (t *hubAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if auth := t.provider.bearer(); auth != "" {
-		req = req.Clone(req.Context())
-		req.Header.Set("Authorization", auth)
+	if t.host != "" && req.URL.Hostname() == t.host {
+		if auth := t.provider.bearer(); auth != "" {
+			req = req.Clone(req.Context())
+			req.Header.Set("Authorization", auth)
+		}
 	}
 	return t.base.RoundTrip(req)
+}
+
+// hostOf 提取 URL 的主机名，解析失败时返回空串（此时不会附加 token）。
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }

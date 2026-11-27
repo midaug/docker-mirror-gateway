@@ -258,7 +258,7 @@ func New(client *http.Client, timeout time.Duration, sources []string, enrichUpd
 			transport = http.DefaultTransport
 		}
 		wrapped := *base
-		wrapped.Transport = &hubAuthTransport{base: transport, provider: s.hubAuth}
+		wrapped.Transport = &hubAuthTransport{base: transport, provider: s.hubAuth, host: hostOf(hubSearchURL)}
 		s.hubClient = &wrapped
 	}
 	return s
@@ -274,6 +274,19 @@ func (s *Service) hubHTTPClient() *http.Client {
 
 // Search 查询所有已启用的来源。单个来源失败不影响其他来源。
 func (s *Service) Search(ctx context.Context, query string, limit int) Response {
+	return s.search(ctx, query, limit, true)
+}
+
+// SearchBasic 与 Search 相同，但不补查标签与更新时间。
+//
+// Registry v1 兼容接口（/v1/search）只需要名字、描述与 star 数；补查标签会
+// 为前 20 条结果各发一次上游请求，对这些客户端纯属浪费。查询词带 :tag 时
+// 仍会补查，因为要用它验证仓库是否真的拥有该标签。
+func (s *Service) SearchBasic(ctx context.Context, query string, limit int) Response {
+	return s.search(ctx, query, limit, false)
+}
+
+func (s *Service) search(ctx context.Context, query string, limit int, enrichFields bool) Response {
 	query = strings.TrimSpace(query)
 	resp := Response{Query: query}
 	if query == "" {
@@ -294,8 +307,10 @@ func (s *Service) Search(ctx context.Context, query string, limit int) Response 
 
 	// 用总 ctx 的预算换取 Hub token（若启用认证），失败会自行降级匿名。
 	// 放在并发查询之前，让登录时间不计入单个来源的 4 秒超时。
+	// renewed 记录 token 是否刚换过：刚换到还被 401 说明凭据有问题，不值得重试。
+	renewed := false
 	if s.hubAuth != nil {
-		s.hubAuth.refresh(ctx)
+		renewed = s.hubAuth.refresh(ctx)
 	}
 
 	type outcome struct {
@@ -335,6 +350,19 @@ func (s *Service) Search(ctx context.Context, query string, limit int) Response 
 			switch src {
 			case "hub":
 				res, err = s.searchHub(srcCtx, searchName, limit)
+				// 缓存里的 token 被拒（过期/吊销）时，换一次新 token 重试。
+				// 否则一次 401 会让 Hub 进入 30 秒冷却，用户看到的是搜索
+				// 里突然没有 Hub 结果。刚换到的 token 也 401 就不再重试，
+				// 那是凭据本身有问题。
+				if err != nil && s.hubAuth != nil && !renewed && s.hubAuth.bearer() != "" {
+					var se *statusError
+					if errors.As(err, &se) && se.code == http.StatusUnauthorized {
+						s.hubAuth.invalidate()
+						if s.hubAuth.refresh(srcCtx) {
+							res, err = s.searchHub(srcCtx, searchName, limit)
+						}
+					}
+				}
 			case "quay":
 				res, err = s.searchQuay(srcCtx, searchName, limit)
 			case "mcr":
@@ -399,7 +427,7 @@ func (s *Service) Search(ctx context.Context, query string, limit int) Response 
 	// 搜索接口只给仓库名，不带标签：补查更新时间与最新版本号。
 	// 排序截断之后再补，避免为用不上的结果发请求；带 tag 搜索时
 	// 还要在这一步验证仓库是否真的拥有该标签，验证不过的直接过滤。
-	if s.enrichUpdated || s.enrichTags || tagFilter != "" {
+	if tagFilter != "" || (enrichFields && (s.enrichUpdated || s.enrichTags)) {
 		resp.Results = s.enrichResults(ctx, resp.Results, tagFilter)
 	}
 	return resp

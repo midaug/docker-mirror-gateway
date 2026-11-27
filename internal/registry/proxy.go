@@ -1080,19 +1080,29 @@ func (p *Proxy) ServeCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 // knownRepositories 返回拉取记录中出现过的仓库名（去重、按字母排序）。
+//
+// 只认至少成功过一次的仓库：一次打错名字的 404 尝试也会留下 failed 记录，
+// 把它算进目录会让 NAS 的镜像列表里出现根本不存在的仓库。
 func (p *Proxy) knownRepositories() []string {
 	records := p.activity.List(0)
-	seen := make(map[string]struct{}, len(records))
-	repos := make([]string, 0, len(records))
+	seen := make(map[string]bool, len(records))
 	for _, rec := range records {
 		if rec.Repo == "" {
 			continue
 		}
-		if _, ok := seen[rec.Repo]; ok {
+		if rec.State == activity.StateFailed {
+			if _, ok := seen[rec.Repo]; !ok {
+				seen[rec.Repo] = false
+			}
 			continue
 		}
-		seen[rec.Repo] = struct{}{}
-		repos = append(repos, rec.Repo)
+		seen[rec.Repo] = true
+	}
+	repos := make([]string, 0, len(seen))
+	for repo, ok := range seen {
+		if ok {
+			repos = append(repos, repo)
+		}
 	}
 	sort.Strings(repos)
 	return repos
