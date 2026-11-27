@@ -135,7 +135,7 @@ func (s *Server) wrap(h http.HandlerFunc) http.Handler {
 // route 是单端口模式下的完整路由。
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case isV2Path(r.URL.Path) || isHealthPath(r.URL.Path) || isTokenPath(r.URL.Path):
+	case isV2Path(r.URL.Path) || isV1SearchPath(r.URL.Path) || isHealthPath(r.URL.Path) || isTokenPath(r.URL.Path):
 		s.servePull(w, r)
 	case isAdminPath(r.URL.Path):
 		s.serveAdmin(w, r)
@@ -151,6 +151,13 @@ func (s *Server) servePull(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleV2(w, r)
+	case isV1SearchPath(r.URL.Path):
+		// 兼容 Docker Registry v1 搜索接口：部分 NAS/面板类客户端
+		// 把镜像站当 Docker Hub 用，会直接请求 /v1/search。
+		if !s.checkAccess(w, r) {
+			return
+		}
+		s.handleV1Search(w, r)
 	case isTokenPath(r.URL.Path):
 		// 令牌换取端点：认证透传模式下 docker 从改写的挑战里拿到这里，
 		// 受与 /v2 相同的访问控制（IP 白名单开启时同样受限）。
@@ -224,6 +231,11 @@ func isV2Path(path string) bool {
 	return path == "/v2" || path == "/v2/" || strings.HasPrefix(path, "/v2/")
 }
 
+// isV1SearchPath 报告是否为 Docker Registry v1 搜索接口。
+func isV1SearchPath(path string) bool {
+	return path == "/v1/search" || path == "/v1/search/"
+}
+
 func isHealthPath(path string) bool {
 	return path == "/healthz" || path == "/readyz"
 }
@@ -266,12 +278,102 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		s.proxy.ServeBlob(w, r, name, ref)
 	case registry.PathTags:
 		s.proxy.ServeTags(w, r, name)
+	case registry.PathCatalog:
+		s.proxy.ServeCatalog(w, r)
 	case registry.PathUpload:
 		w.Header().Set("Allow", "GET, HEAD")
 		registry.WriteError(w, http.StatusMethodNotAllowed, "UNSUPPORTED", "docker-mirror-gateway 是只读镜像代理，不支持推送", nil)
 	default:
 		registry.WriteError(w, http.StatusNotFound, "UNSUPPORTED", "不支持的接口路径", map[string]string{"path": r.URL.Path})
 	}
+}
+
+// ---------- Docker Registry v1 搜索兼容 ----------
+
+const (
+	v1SearchDefaultLimit = 25
+	// v1SearchMaxLimit 与搜索服务单次返回的结果上限一致。
+	v1SearchMaxLimit = search.MaxLimit
+)
+
+// v1SearchResult 是 Registry v1 搜索接口的单条结果。
+type v1SearchResult struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	StarCount   int    `json:"star_count"`
+	IsOfficial  bool   `json:"is_official"`
+	IsAutomated bool   `json:"is_automated"`
+}
+
+// v1SearchResponse 是 Registry v1 搜索接口的响应。
+type v1SearchResponse struct {
+	NumResults int              `json:"num_results"`
+	Query      string           `json:"query"`
+	Results    []v1SearchResult `json:"results"`
+}
+
+// handleV1Search 处理 GET /v1/search，把多源搜索的结果转成 v1 格式。
+//
+// Docker Registry v1 已被淘汰，但部分 NAS、面板类客户端仍把镜像站当
+// Docker Hub 用、直接请求这个接口；返回 404 会让这些界面的搜索不可用。
+func (s *Server) handleV1Search(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET")
+		return
+	}
+	if s.search == nil || !s.cfg.Search.Enabled {
+		writeJSONError(w, http.StatusNotFound, "搜索未启用")
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		writeJSONError(w, http.StatusBadRequest, "缺少查询参数 q")
+		return
+	}
+	// HEAD 只需要与 GET 一致的状态码，不必真的跑一次搜索。
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	n := v1SearchDefaultLimit
+	if v := r.URL.Query().Get("n"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	if n > v1SearchMaxLimit {
+		n = v1SearchMaxLimit
+	}
+	page := 1
+	if v := r.URL.Query().Get("page"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	// 限制页码，避免超大数字在计算偏移时溢出。
+	if page > v1SearchMaxLimit {
+		page = v1SearchMaxLimit
+	}
+	// 第二页起把服务上限的结果都取回来再切片；第一页只取 n 条。
+	fetch := n
+	if page > 1 {
+		fetch = v1SearchMaxLimit
+	}
+	resp := s.search.Search(r.Context(), query, fetch)
+	start := (page - 1) * n
+	results := make([]v1SearchResult, 0, n)
+	for i := start; i < len(resp.Results) && len(results) < n; i++ {
+		item := resp.Results[i]
+		results = append(results, v1SearchResult{
+			Name:        item.Name,
+			Description: item.Description,
+			StarCount:   item.Stars,
+			IsOfficial:  item.Official,
+		})
+	}
+	writeJSON(w, http.StatusOK, v1SearchResponse{NumResults: len(results), Query: query, Results: results})
 }
 
 // ---------- 管理接口 ----------

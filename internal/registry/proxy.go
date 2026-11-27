@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1024,6 +1025,77 @@ func (p *Proxy) ServeTags(w http.ResponseWriter, r *http.Request, name string) {
 		msg = fmt.Sprintf("%s（另有 %d 个镜像源未收录此仓库）", msg, missing)
 	}
 	writeRegistryError(w, http.StatusBadGateway, "UNKNOWN", msg, nil)
+}
+
+// maxCatalogPage 是 /v2/_catalog 单页返回的仓库数上限。
+const maxCatalogPage = 1000
+
+// ServeCatalog 处理 /v2/_catalog：按名称排序列出拉取记录中出现过的仓库。
+//
+// 网关是拉取代理，无法枚举上游全部仓库；这里把「本地见过的仓库」当作目录，
+// 让依赖 _catalog 的第三方 UI 能正常浏览，而不是收到 404。
+// 支持 Registry v2 规范的 n / last 分页。
+func (p *Proxy) ServeCatalog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeMethodNotAllowed(w, "GET, HEAD")
+		return
+	}
+	n := 100
+	if v := r.URL.Query().Get("n"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	if n > maxCatalogPage {
+		n = maxCatalogPage
+	}
+
+	repos := p.knownRepositories()
+	start := 0
+	if last := r.URL.Query().Get("last"); last != "" {
+		// last 是上一页最后一个仓库名，下一页从它之后开始。
+		start = sort.Search(len(repos), func(i int) bool { return repos[i] > last })
+	}
+	end := start + n
+	if end > len(repos) {
+		end = len(repos)
+	}
+	page := repos[start:end]
+	if page == nil {
+		page = []string{}
+	}
+	if end < len(repos) && len(page) > 0 {
+		q := url.Values{}
+		q.Set("n", strconv.Itoa(n))
+		q.Set("last", page[len(page)-1])
+		w.Header().Set("Link", fmt.Sprintf("</v2/_catalog?%s>; rel=\"next\"", q.Encode()))
+	}
+	w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string][]string{"repositories": page})
+}
+
+// knownRepositories 返回拉取记录中出现过的仓库名（去重、按字母排序）。
+func (p *Proxy) knownRepositories() []string {
+	records := p.activity.List(0)
+	seen := make(map[string]struct{}, len(records))
+	repos := make([]string, 0, len(records))
+	for _, rec := range records {
+		if rec.Repo == "" {
+			continue
+		}
+		if _, ok := seen[rec.Repo]; ok {
+			continue
+		}
+		seen[rec.Repo] = struct{}{}
+		repos = append(repos, rec.Repo)
+	}
+	sort.Strings(repos)
+	return repos
 }
 
 // resolve 把仓库名解析到分组；ref 非空时用该 manifest 做精确判定。

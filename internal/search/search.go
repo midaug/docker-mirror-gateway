@@ -27,7 +27,8 @@ import (
 )
 
 const (
-	maxLimit       = 50
+	// MaxLimit 是单次搜索返回的结果数上限。
+	MaxLimit       = 50
 	defaultTimeout = 8 * time.Second
 	userAgent      = "docker-mirror-gateway/1.0"
 	// sourceTimeout 是单个来源的超时。总超时往往给到 8 秒，
@@ -284,8 +285,8 @@ func (s *Service) Search(ctx context.Context, query string, limit int) Response 
 	if limit <= 0 {
 		limit = 20
 	}
-	if limit > maxLimit {
-		limit = maxLimit
+	if limit > MaxLimit {
+		limit = MaxLimit
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)

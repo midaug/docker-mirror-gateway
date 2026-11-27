@@ -6,13 +6,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/midaug/docker-mirror-gateway/internal/cache"
 	"github.com/midaug/docker-mirror-gateway/internal/config"
 	"github.com/midaug/docker-mirror-gateway/internal/metrics"
 	"github.com/midaug/docker-mirror-gateway/internal/registry"
+	"github.com/midaug/docker-mirror-gateway/internal/search"
 )
 
 func newTestServer(t *testing.T, adminToken string) *Server {
@@ -68,7 +71,7 @@ func TestV2Root(t *testing.T) {
 func TestUnknownRegistryRoute(t *testing.T) {
 	s := newTestServer(t, "")
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/_catalog", nil))
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/unknown/path", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("状态码 = %d, 期望 404", rec.Code)
 	}
@@ -260,5 +263,146 @@ func TestActivityEndpoint(t *testing.T) {
 	secured.AdminHandler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("带令牌状态码 = %d", rec.Code)
+	}
+}
+
+// rewriteTransport 把搜索请求统一改写到本地假服务，避免测试依赖外网。
+type rewriteTransport struct {
+	target *url.URL
+	base   http.RoundTripper
+}
+
+func (t *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.URL.Scheme = t.target.Scheme
+	clone.URL.Host = t.target.Host
+	return t.base.RoundTrip(clone)
+}
+
+func newV1SearchServer(t *testing.T, hub http.Handler) *Server {
+	t.Helper()
+	fake := httptest.NewServer(hub)
+	t.Cleanup(fake.Close)
+	target, err := url.Parse(fake.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &rewriteTransport{target: target, base: http.DefaultTransport}}
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := search.New(client, 2*time.Second, []string{"hub"}, false, log, search.WithHubClient(client))
+	s := newTestServer(t, "")
+	s.search = svc
+	return s
+}
+
+func TestV1SearchCompat(t *testing.T) {
+	hub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/search/repositories/" {
+			t.Errorf("请求路径 = %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("query"); got != "nginx" {
+			t.Errorf("query 参数 = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"count":3,"results":[
+			{"repo_name":"library/nginx","short_description":"Official build of Nginx.","star_count":20000,"pull_count":1000000,"is_official":true},
+			{"repo_name":"nginxinc/nginx-unprivileged","short_description":"unprivileged","star_count":120,"pull_count":1000},
+			{"repo_name":"bitnami/nginx","short_description":"Bitnami","star_count":50,"pull_count":500}
+		]}`)
+	})
+	s := newV1SearchServer(t, hub)
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/search?q=nginx&n=2&page=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 响应体 = %s", rec.Code, rec.Body.String())
+	}
+	var body v1SearchResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if body.Query != "nginx" || body.NumResults != 2 || len(body.Results) != 2 {
+		t.Fatalf("响应内容异常: %+v", body)
+	}
+	first := body.Results[0]
+	if first.Name != "library/nginx" || !first.IsOfficial || first.StarCount != 20000 {
+		t.Errorf("首条结果 = %+v", first)
+	}
+	if first.Description != "Official build of Nginx." || first.IsAutomated {
+		t.Errorf("首条结果其余字段 = %+v", first)
+	}
+
+	// 第二页取剩余结果。
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/search?q=nginx&n=2&page=2", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析第二页失败: %v", err)
+	}
+	if len(body.Results) != 1 || body.Results[0].Name != "bitnami/nginx" {
+		t.Errorf("第二页结果 = %+v", body.Results)
+	}
+
+	// 缺少 q、方法不对、搜索关闭时的错误码。
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/search", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("缺少 q 状态码 = %d, 期望 400", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/search?q=nginx", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST 状态码 = %d, 期望 405", rec.Code)
+	}
+	s.cfg.Search.Enabled = false
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/search?q=nginx", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("搜索关闭状态码 = %d, 期望 404", rec.Code)
+	}
+}
+
+func TestCatalogListsKnownRepositories(t *testing.T) {
+	s := newTestServer(t, "")
+	tracker := s.proxy.Activity()
+	for _, repo := range []string{"library/nginx", "library/alpine", "library/nginx"} {
+		e := tracker.Begin("manifest", repo, "latest", "dockerhub")
+		e.Finish()
+	}
+
+	var body struct {
+		Repositories []string `json:"repositories"`
+	}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/_catalog", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 响应体 = %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	want := []string{"library/alpine", "library/nginx"}
+	if len(body.Repositories) != 2 || body.Repositories[0] != want[0] || body.Repositories[1] != want[1] {
+		t.Fatalf("目录 = %v, 期望 %v", body.Repositories, want)
+	}
+
+	// n / last 分页与 Link 头。
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/_catalog?n=1", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析分页响应失败: %v", err)
+	}
+	if len(body.Repositories) != 1 || body.Repositories[0] != "library/alpine" {
+		t.Fatalf("第一页 = %v", body.Repositories)
+	}
+	if link := rec.Header().Get("Link"); !strings.Contains(link, "last=library%2Falpine") {
+		t.Errorf("Link 头 = %q", link)
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/_catalog?n=1&last=library%2Falpine", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析第二页失败: %v", err)
+	}
+	if len(body.Repositories) != 1 || body.Repositories[0] != "library/nginx" {
+		t.Errorf("第二页 = %v", body.Repositories)
 	}
 }

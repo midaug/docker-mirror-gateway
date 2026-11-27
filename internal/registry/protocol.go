@@ -36,6 +36,7 @@ const (
 	PathBlob
 	PathTags
 	PathUpload
+	PathCatalog
 )
 
 var (
@@ -48,6 +49,10 @@ func ParseV2Path(rest string) (kind PathKind, name, ref string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "" {
 		return PathUnknown, "", ""
+	}
+	// 仓库名不允许以 _ 开头，_catalog 只可能是仓库目录端点本身。
+	if rest == "_catalog" || rest == "_catalog/" {
+		return PathCatalog, "", ""
 	}
 	if strings.HasSuffix(rest, "/tags/list") {
 		return PathTags, strings.TrimSuffix(rest, "/tags/list"), ""

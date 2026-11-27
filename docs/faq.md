@@ -44,6 +44,12 @@ dockerproxy 等源对不存在的 manifest/blob 返回 500，但 body 里带 `MA
 **配置了 adminAddr 后，拉取端口访问控制台是 404**
 预期行为，控制台与管理接口只在管理端口。
 
+**NAS / 面板里的镜像搜索没有结果**
+这类客户端多数还在用 Docker Registry v1 的 `GET /v1/search?q=...`。网关已兼容该接口，结果来自与控制台相同的多源搜索（`search.sources`），返回 `num_results` / `results` 结构；`n`、`page` 参数照常生效。
+
+**`GET /v2/_catalog` 只列出部分仓库**
+网关是拉取代理，无法枚举上游全部仓库。`_catalog` 返回的是拉取记录里出现过的仓库名（去重、按名称排序，支持 `n` / `last` 分页），够 NAS、面板类 UI 浏览；没拉过的仓库不会出现在列表里。
+
 **改了 `config.yaml` 但没生效**
 配置只在启动时加载，改完要重启进程或容器；`/api/v1/status` 里每个上游的 `proxy` 字段可以直接确认当前生效的值。
 

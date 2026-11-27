@@ -15,7 +15,7 @@ func TestParseV2Path(t *testing.T) {
 			"library/nginx", "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
 		{"library/nginx/blobs/uploads/", PathUpload, "library/nginx", ""},
 		{"library/nginx/tags/list", PathTags, "library/nginx", ""},
-		{"_catalog", PathUnknown, "", ""},
+		{"_catalog", PathCatalog, "", ""},
 		{"", PathUnknown, "", ""},
 	}
 	for _, tt := range tests {
